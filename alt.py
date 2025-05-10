@@ -1,348 +1,237 @@
-import telegram # Этот импорт может быть не нужен, если все типы берутся из telegram.
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ParseMode # ParseMode импортируется отсюда
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes, # Замена для CallbackContext в аннотациях типов
-    MessageHandler, # Если будете добавлять обработчики сообщений
-    filters # С маленькой буквы
-)
-import subprocess
 import logging
 import os
-import mss
-import mss.tools
-import psutil
-import time
+import sys
+import subprocess
+import asyncio
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram.constants import ParseMode # Важно для HTML
 
-# Включим логирование
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                    level=logging.INFO)
-logger = logging.getLogger(__name__)
+# --- КОНФИГУРАЦИЯ ---
+TELEGRAM_BOT_TOKEN = "5571710712:AAGuAAqCYgiXw8fAg3uaEq-dlNnFCcWFbas" # <--- ЗАМЕНИ НА СВОЙ ТОКЕН
+ALLOWED_USER_ID = "1314664622"           # <--- ЗАМЕНИ НА СВОЙ ID (в виде строки)
+# --------------------
 
-# --- НАСТРОЙКИ БОТА ---
-BOT_TOKEN = "5571710712:AAGuAAqCYgiXw8fAg3uaEq-dlNnFCcWFbas" # ЗАМЕНИТЕ НА ВАШ ТОКЕН
-ALLOWED_USER_ID = 1314664622         # ЗАМЕНИТЕ НА ВАШ TELEGRAM USER ID
+# Получаем директорию, где находится текущий скрипт
+SCRIPT_PATH = os.path.abspath(__file__)
+SCRIPT_DIR = os.path.dirname(SCRIPT_PATH)
 
-ALLOWED_PROGRAMS = {
-    "Блокнот": {
-        "cmd": "notepad.exe",
-        "process_name": "notepad.exe"
-    },
-    "Калькулятор": {
-        "cmd": "calc.exe",
-        "process_name": "calc.exe" # или Calculator.exe, CalculatorApp.exe
-    },
-    "Проводник": {
-        "cmd": "explorer.exe",
-        "process_name": "explorer.exe"
-    },
-}
-# --- КОНЕЦ НАСТРОЕК ---
+# Глобальный логгер (будет инициализирован в main)
+logger = None
 
-SCREENSHOT_FILENAME = "screenshot.png"
-
-# --- Проверка прав пользователя ---
-async def is_user_allowed(update: Update) -> bool: # Функции обработчиков теперь async
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправляет приветственное сообщение при команде /start."""
     user = update.effective_user
-    if not user or user.id != ALLOWED_USER_ID:
-        if update.callback_query:
-            await update.callback_query.answer("У вас нет доступа к этому боту.", show_alert=True)
-        elif update.message:
-            await update.message.reply_text("У вас нет доступа к этому боту.")
-        logger.warning(f"Несанкционированная попытка доступа от пользователя {user.id if user else 'unknown'} ({user.first_name if user else 'unknown'})")
-        return False
-    return True
-
-# --- Функции для создания клавиатур ---
-def get_main_menu_keyboard() -> InlineKeyboardMarkup:
-    keyboard = [
-        [InlineKeyboardButton("🚀 Запустить программу", callback_data='menu_run')],
-        [InlineKeyboardButton("🔄 Перезапустить программу", callback_data='menu_restart')],
-        [InlineKeyboardButton("📸 Сделать скриншот", callback_data='menu_screenshot')],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def get_programs_keyboard(action_prefix: str) -> InlineKeyboardMarkup:
-    keyboard = []
-    for alias, details in ALLOWED_PROGRAMS.items():
-        display_name = details.get("display_name", alias)
-        keyboard.append([InlineKeyboardButton(display_name, callback_data=f'{action_prefix}:{alias}')])
-    keyboard.append([InlineKeyboardButton("⬅️ Назад в главное меню", callback_data='menu_main')])
-    return InlineKeyboardMarkup(keyboard)
-
-# --- Обработчики команд ---
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: # async и ContextTypes
-    if not await is_user_allowed(update): return # await для async функции
-    user = update.effective_user
-    await update.message.reply_text( # await для асинхронных вызовов API
-        f"Привет, {user.first_name}!\n"
-        "Выберите действие:",
-        reply_markup=get_main_menu_keyboard()
+    await update.message.reply_html(
+        rf"Привет, {user.mention_html()}! Я твой бот. Используй /menu для доступа к командам управления.",
     )
+    logger.info(f"Пользователь {user.id} ({user.username}) запустил команду /start")
 
-# --- Логика для операций с программами ---
-async def _send_message_or_edit(query: telegram.CallbackQuery | None,
-                                chat_id: int,
-                                bot: telegram.Bot,
-                                text_to_send: str,
-                                reply_markup: InlineKeyboardMarkup | None = None):
-    try:
-        if query:
-            await query.edit_message_text(text=text_to_send, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
-        elif chat_id and bot:
-            await bot.send_message(chat_id=chat_id, text=text_to_send, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
-        else:
-            logger.error("Невозможно отправить сообщение: нет query, chat_id или bot.")
-    except telegram.error.BadRequest as e:
-        if "Message is not modified" in str(e):
-            logger.info("Сообщение не изменено, пропуск редактирования.")
-            if query and reply_markup:
-                 try:
-                     await query.edit_message_reply_markup(reply_markup=reply_markup)
-                 except Exception as e_markup:
-                     logger.error(f"Не удалось обновить только клавиатуру: {e_markup}")
-        else:
-            logger.error(f"Ошибка BadRequest при отправке/редактировании сообщения: {e} (текст: {text_to_send})")
-            if chat_id and bot: # Запасной вариант
-                try:
-                    await bot.send_message(chat_id=chat_id, text=text_to_send, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
-                except Exception as e_send:
-                    logger.error(f"Не удалось отправить сообщение после BadRequest: {e_send}")
-
-    except Exception as e:
-        logger.error(f"Общая ошибка при отправке/редактировании сообщения: {e}")
-        if chat_id and bot:
-            try:
-                await bot.send_message(chat_id=chat_id, text=text_to_send, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
-            except Exception as e_send_final:
-                logger.error(f"Не удалось отправить сообщение после общей ошибки: {e_send_final}")
-
-
-async def _perform_launch_program(program_alias: str, chat_id: int, bot: telegram.Bot, query: telegram.CallbackQuery = None) -> None:
-    if program_alias not in ALLOWED_PROGRAMS:
-        await _send_message_or_edit(query, chat_id, bot, f"Программа '{program_alias}' не найдена.")
-        return
-
-    program_info = ALLOWED_PROGRAMS[program_alias]
-    command_to_run = program_info['cmd']
-    display_name = program_info.get("display_name", program_alias)
-
-    try:
-        # Запуск процесса остается синхронным
-        if isinstance(command_to_run, list):
-            subprocess.Popen(command_to_run)
-        else:
-            subprocess.Popen([command_to_run])
-        logger.info(f"Команда запуска для '{display_name}' ('{command_to_run}') выполнена.")
-        await _send_message_or_edit(query, chat_id, bot, f"Программа '<b>{display_name}</b>' запущена.", reply_markup=get_main_menu_keyboard())
-    except FileNotFoundError:
-        msg = f"Ошибка: Файл программы для '<b>{display_name}</b>' ('{command_to_run}') не найден."
-        logger.error(msg)
-        await _send_message_or_edit(query, chat_id, bot, msg, reply_markup=get_main_menu_keyboard())
-    except Exception as e:
-        msg = f"Не удалось запустить программу '<b>{display_name}</b>': {e}"
-        logger.error(msg)
-        await _send_message_or_edit(query, chat_id, bot, msg, reply_markup=get_main_menu_keyboard())
-
-def _find_and_terminate_processes(process_name_target: str) -> tuple[bool, str]: # Эта функция остается синхронной
-    terminated_pids = []
-    killed_pids_forcefully = []
-    process_name_target_lower = process_name_target.lower()
-
-    for proc in psutil.process_iter(['pid', 'name']):
-        try:
-            p_name = proc.info['name']
-            if p_name and process_name_target_lower in p_name.lower():
-                p = psutil.Process(proc.info['pid'])
-                p.terminate() # Попытка мягкого завершения
-                terminated_pids.append(proc.info['pid'])
-                logger.info(f"Запрошено мягкое завершение процесса: {p_name} (PID: {proc.info['pid']})")
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            pass
-        except Exception as e:
-            logger.error(f"Ошибка при попытке мягкого завершения процесса {proc.info.get('name', 'N/A')}: {e}")
-
-    if not terminated_pids:
-        return True, f"Активные процессы, связанные с '{process_name_target}', не найдены для завершения."
-
-    # Даем время на мягкое завершение
-    # В асинхронном контексте лучше использовать await asyncio.sleep(1.5)
-    # Но т.к. эта функция вызывается из async, но сама по себе блокирующая, time.sleep тут допустим.
-    time.sleep(1.5)
-
-    for pid in terminated_pids:
-        if psutil.pid_exists(pid): # Проверяем, существует ли еще процесс
-            try:
-                p = psutil.Process(pid)
-                p.kill() # Принудительное завершение
-                killed_pids_forcefully.append(pid)
-                logger.info(f"Принудительно завершен процесс PID: {pid} (не ответил на terminate)")
-            except (psutil.NoSuchProcess, psutil.AccessDenied): # Процесс мог уже завершиться сам
-                pass
-            except Exception as e:
-                logger.error(f"Ошибка при принудительном завершении PID {pid}: {e}")
-
-    msg_parts = [f"Попытка завершения процессов для '{process_name_target}' завершена."]
-    if terminated_pids:
-         msg_parts.append(f"Запрошено завершение для {len(terminated_pids)} процессов.")
-    if killed_pids_forcefully:
-        msg_parts.append(f"{len(killed_pids_forcefully)} из них были завершены принудительно.")
-
-    return True, " ".join(msg_parts)
-
-
-async def _perform_restart_program(program_alias: str, chat_id: int, bot: telegram.Bot, query: telegram.CallbackQuery = None) -> None:
-    if program_alias not in ALLOWED_PROGRAMS:
-        await _send_message_or_edit(query, chat_id, bot, f"Программа '{program_alias}' не найдена.")
-        return
-
-    program_info = ALLOWED_PROGRAMS[program_alias]
-    process_to_find_and_kill = program_info.get('process_name')
-    display_name = program_info.get("display_name", program_alias)
-
-    if not process_to_find_and_kill:
-        msg = f"Для программы '<b>{display_name}</b>' не указано 'process_name' в конфигурации. Не могу перезапустить."
-        logger.warning(f"Для {program_alias} не указан 'process_name'.")
-        await _send_message_or_edit(query, chat_id, bot, msg, reply_markup=get_main_menu_keyboard())
-        return
-
-    await _send_message_or_edit(query, chat_id, bot, f"Начинаю перезапуск '<b>{display_name}</b>'...")
-    # await asyncio.sleep(0.5) # Если нужен неблокирующий сон
-
-    # _find_and_terminate_processes синхронная, ее результат получаем сразу
-    success_terminate, term_message = _find_and_terminate_processes(process_to_find_and_kill)
-    await _send_message_or_edit(query, chat_id, bot, term_message) # Сообщаем о результате завершения
-    # await asyncio.sleep(0.5)
-
-    if not success_terminate: # Хотя наша функция всегда возвращает True первым элементом
-        await _send_message_or_edit(query, chat_id, bot, f"Не удалось корректно завершить процессы для '<b>{display_name}</b>'. Перезапуск отменен.", reply_markup=get_main_menu_keyboard())
-        return
-
-    # Запускаем программу снова (синхронно)
-    command_to_run = program_info['cmd']
-    try:
-        if isinstance(command_to_run, list):
-            subprocess.Popen(command_to_run)
-        else:
-            subprocess.Popen([command_to_run])
-        logger.info(f"Команда повторного запуска для '{display_name}' ('{command_to_run}') выполнена.")
-        await _send_message_or_edit(query, chat_id, bot, f"Программа '<b>{display_name}</b>' успешно перезапущена.", reply_markup=get_main_menu_keyboard())
-    except FileNotFoundError:
-        msg = f"Ошибка: Файл программы для '<b>{display_name}</b>' ('{command_to_run}') не найден после перезапуска."
-        logger.error(msg)
-        await _send_message_or_edit(query, chat_id, bot, msg, reply_markup=get_main_menu_keyboard())
-    except Exception as e:
-        msg = f"Не удалось перезапустить программу '<b>{display_name}</b>': {e}"
-        logger.error(msg)
-        await _send_message_or_edit(query, chat_id, bot, msg, reply_markup=get_main_menu_keyboard())
-
-
-async def _perform_take_screenshot(chat_id: int, bot: telegram.Bot, query: telegram.CallbackQuery = None) -> None:
-    try:
-        # mss работает синхронно
-        with mss.mss() as sct:
-            monitor_number = 1 # Первый монитор, если у вас их несколько, может быть другой
-            # Проверка, что такой монитор существует. sct.monitors[0] - вся область, sct.monitors[1] - первый физический.
-            if len(sct.monitors) <= monitor_number: # Если всего один монитор (или меньше)
-                 monitor_info = sct.monitors[0] # Берем всю область (часто это то, что нужно)
-            else:
-                 monitor_info = sct.monitors[monitor_number] # Берем конкретный монитор
-
-            sct_img = sct.grab(monitor_info)
-            mss.tools.to_png(sct_img.rgb, sct_img.size, output=SCREENSHOT_FILENAME)
-            logger.info(f"Скриншот сохранен как {SCREENSHOT_FILENAME}")
-
-        with open(SCREENSHOT_FILENAME, 'rb') as photo_file:
-            await bot.send_photo(chat_id=chat_id, photo=photo_file, caption="Вот ваш скриншот:")
-        logger.info(f"Скриншот отправлен пользователю {chat_id}")
-        # После отправки фото, если это был callback, редактируем исходное сообщение
-        if query:
-            await _send_message_or_edit(query, chat_id, bot, "Выберите следующее действие:", reply_markup=get_main_menu_keyboard())
-        else: # Если это был не callback (например, команда /screenshot)
-            await bot.send_message(chat_id=chat_id, text="Выберите следующее действие:", reply_markup=get_main_menu_keyboard())
-
-
-    except Exception as e:
-        message = f"Не удалось сделать или отправить скриншот: {e}"
-        logger.error(message)
-        await _send_message_or_edit(query, chat_id, bot, message, reply_markup=get_main_menu_keyboard())
-    finally:
-        if os.path.exists(SCREENSHOT_FILENAME):
-            try:
-                os.remove(SCREENSHOT_FILENAME) # Синхронное удаление
-            except Exception as e_rem:
-                 logger.error(f"Ошибка при удалении файла {SCREENSHOT_FILENAME}: {e_rem}")
-
-# --- Обработчик нажатий на кнопки ---
-async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await is_user_allowed(update): return
-
+async def perform_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обновляет бота через git pull."""
     query = update.callback_query
-    await query.answer() # Отвечаем на callback query
+    await query.answer(text="Обновляю бота...")
+    await query.edit_message_text(text="⏳ Попытка обновления через `git pull`...")
+    logger.info(f"Пользователь {query.from_user.id} инициировал обновление бота.")
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            'git', 'pull',
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=SCRIPT_DIR # Указываем рабочую директорию для git
+        )
+        stdout, stderr = await process.communicate()
+
+        output_message = ""
+        if process.returncode == 0:
+            git_output = stdout.decode('utf-8', errors='replace').strip()
+            if not git_output:
+                git_output = "Нет изменений для загрузки."
+            elif "Already up to date." in git_output:
+                git_output = "Репозиторий уже обновлен до последней версии."
+
+            output_message = f"✅ Обновление завершено!\n\n<b>Результат git pull:</b>\n<pre>{git_output}</pre>\n\nℹ️ Для применения всех изменений рекомендуется перезапустить бота."
+            logger.info(f"Git pull successful: {git_output}")
+        else:
+            git_error_output = stderr.decode('utf-8', errors='replace').strip()
+            output_message = f"⚠️ Ошибка при обновлении:\n\n<pre>{git_error_output}</pre>"
+            logger.error(f"Git pull failed: {git_error_output}")
+
+        keyboard_after_action = [
+            [InlineKeyboardButton("🔁 Перезапустить сейчас", callback_data='restart_bot')],
+            [InlineKeyboardButton("Меню", callback_data='show_menu')],
+            [InlineKeyboardButton("Закрыть", callback_data='close_menu')]
+        ]
+        reply_markup_after_action = InlineKeyboardMarkup(keyboard_after_action)
+        await query.edit_message_text(text=output_message, reply_markup=reply_markup_after_action, parse_mode=ParseMode.HTML)
+
+    except FileNotFoundError:
+        logger.error("Команда 'git' не найдена. Убедитесь, что Git установлен и доступен в PATH.")
+        await query.edit_message_text(text="❌ Ошибка: команда 'git' не найдена. Git должен быть установлен и доступен в системном PATH.")
+    except Exception as e:
+        logger.error(f"Непредвиденная ошибка при обновлении: {e}")
+        await query.edit_message_text(text=f"❌ Непредвиденная ошибка при обновлении: {e}")
+
+async def perform_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Перезапускает бота."""
+    query = update.callback_query
+    await query.answer(text="Перезапускаю бота...")
+    logger.info(f"Пользователь {query.from_user.id} инициировал перезапуск бота.")
+    try:
+        await query.edit_message_text(text="⏳ Бот перезапускается... Пожалуйста, подождите.\nНовое сообщение придет после успешного запуска (если он произойдет).")
+    except Exception as e:
+        logger.warning(f"Не удалось отредактировать сообщение перед перезапуском: {e}")
+
+    # Небольшая задержка, чтобы успеть отправить сообщение и Telegram его обработал
+    await asyncio.sleep(1)
+
+    try:
+        logger.info(f"Перезапуск с помощью: {sys.executable} {' '.join(sys.argv)}")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as e:
+        logger.error(f"Ошибка при попытке перезапуска: {e}")
+        # Попытка отправить сообщение об ошибке, если это возможно
+        try:
+            await context.bot.send_message(chat_id=query.from_user.id, text=f"❌ Критическая ошибка при перезапуске: {e}. Бот может не работать. Проверьте логи.")
+        except Exception as send_e:
+            logger.error(f"Не удалось отправить сообщение об ошибке перезапуска: {send_e}")
+
+
+async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, query=None):
+    """Отображает главное меню управления или редактирует существующее сообщение."""
+    keyboard = [
+        [InlineKeyboardButton("🔄 Обновить бота (git pull)", callback_data='update_bot')],
+        [InlineKeyboardButton("🔁 Перезапустить бота", callback_data='restart_bot')],
+        [InlineKeyboardButton("Закрыть меню", callback_data='close_menu')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    menu_text = '⚙️ <b>Меню управления ботом:</b>'
+
+    if query: # Если функция вызвана из callback_query (нажатие кнопки "Меню")
+        try:
+            await query.edit_message_text(text=menu_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            logger.warning(f"Не удалось отредактировать меню (возможно, сообщение было изменено): {e}")
+            # Если редактирование не удалось, попробуем отправить новое сообщение
+            await context.bot.send_message(chat_id=query.from_user.id, text=menu_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+
+    elif update.message: # Если функция вызвана командой /menu
+        await update.message.reply_text(text=menu_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+
+
+async def menu_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик команды /menu."""
+    user_id = update.effective_user.id
+    if str(user_id) != ALLOWED_USER_ID:
+        await update.message.reply_text("⛔ У вас нет прав для выполнения этой команды.")
+        logger.warning(f"Попытка доступа к /menu от неавторизованного пользователя: {user_id} ({update.effective_user.username})")
+        return
+    await show_menu(update, context)
+
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает нажатия на inline-кнопки."""
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    if str(user_id) != ALLOWED_USER_ID:
+        await query.answer("⛔ У вас нет прав для этого действия.", show_alert=True)
+        logger.warning(f"Попытка использования кнопки меню от неавторизованного пользователя: {user_id}, data: {query.data}")
+        return
 
     data = query.data
-    chat_id = query.message.chat_id
-    bot = context.bot # Объект bot доступен через context
+    logger.info(f"Нажата кнопка: {data} пользователем {user_id}")
 
-    if data == 'menu_main':
-        await _send_message_or_edit(query, chat_id, bot, "Главное меню:", reply_markup=get_main_menu_keyboard())
-    elif data == 'menu_run':
-        await _send_message_or_edit(query, chat_id, bot, "Выберите программу для запуска:", reply_markup=get_programs_keyboard('run'))
-    elif data == 'menu_restart':
-        await _send_message_or_edit(query, chat_id, bot, "Выберите программу для перезапуска:", reply_markup=get_programs_keyboard('restart'))
-    elif data == 'menu_screenshot':
-        await _send_message_or_edit(query, chat_id, bot, "Делаю скриншот...")
-        await _perform_take_screenshot(chat_id, bot, query)
-    elif data.startswith('run:'):
-        program_alias = data.split(':', 1)[1]
-        display_name = ALLOWED_PROGRAMS.get(program_alias, {}).get('display_name', program_alias)
-        await _send_message_or_edit(query, chat_id, bot, f"Запускаю '<b>{display_name}</b>'...")
-        await _perform_launch_program(program_alias, chat_id, bot, query)
-    elif data.startswith('restart:'):
-        program_alias = data.split(':', 1)[1]
-        # Сообщение о начале перезапуска будет внутри _perform_restart_program
-        await _perform_restart_program(program_alias, chat_id, bot, query)
-
-# --- Обработчик ошибок ---
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(msg="Exception while handling an update:", exc_info=context.error)
-    # В v20 context.error это само исключение
-    # update может быть None, если ошибка произошла вне обработки update
-    if isinstance(update, Update) and update.effective_chat:
+    if data == 'update_bot':
+        await perform_update(update, context)
+    elif data == 'restart_bot':
+        await perform_restart(update, context)
+    elif data == 'show_menu':
+        await query.answer() # Отвечаем на callback перед редактированием
+        await show_menu(update, context, query=query)
+    elif data == 'close_menu':
+        await query.answer()
         try:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"Произошла ошибка. Попробуйте снова или команду /start.\nДетали: {context.error}"
-            )
+            await query.edit_message_text(text="Меню закрыто.")
         except Exception as e:
-            logger.error(f"Не удалось отправить сообщение об ошибке пользователю: {e}")
+            logger.warning(f"Не удалось закрыть меню (возможно, оно уже было изменено): {e}")
+    else:
+        await query.answer("Неизвестное действие.") # Отвечаем на callback
+        logger.warning(f"Получен неизвестный callback_data: {data}")
 
+async def post_init(application: Application) -> None:
+    """Выполняется после инициализации приложения и перед запуском поллинга."""
+    if ALLOWED_USER_ID:
+        try:
+            await application.bot.send_message(
+                chat_id=ALLOWED_USER_ID,
+                text="✅ Бот успешно запущен/перезапущен и готов к работе!\nИспользуйте /menu для управления."
+            )
+            logger.info(f"Отправлено уведомление о запуске пользователю {ALLOWED_USER_ID}")
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление о запуске пользователю {ALLOWED_USER_ID}: {e}")
 
 def main() -> None:
-    if BOT_TOKEN == "ВАШ_ТЕЛЕГРАМ_БОТ_ТОКЕН" or ALLOWED_USER_ID == 123456789:
-        print("ПОЖАЛУЙСТА, ОТРЕДАКТИРУЙТЕ СКРИПТ!")
-        print("Укажите ваш BOT_TOKEN и ALLOWED_USER_ID в начале файла.")
-        return
+    """Основная функция запуска бота."""
+    global logger # Делаем logger доступным глобально
 
-    # Инициализация для python-telegram-bot v20+
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Настройка логирования
+    # Установка PYTHONIOENCODING=UTF-8 в переменных окружения рекомендуется для Windows
+    # или chcp 65001 в CMD перед запуском
+    logging.basicConfig(
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        level=logging.INFO,
+        handlers=[
+            logging.FileHandler("bot.log", encoding='utf-8'), # Логирование в файл
+            logging.StreamHandler(sys.stdout) # Логирование в консоль (убедитесь, что консоль поддерживает UTF-8)
+        ]
+    )
+    logger = logging.getLogger(__name__) # Инициализируем глобальный логгер
+
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "ТВОЙ_ТЕЛЕГРАМ_БОТ_ТОКЕН":
+        logger.critical("TELEGRAM_BOT_TOKEN не задан или используется значение по умолчанию! Бот не может быть запущен.")
+        sys.exit("Ошибка: TELEGRAM_BOT_TOKEN не задан. Укажите токен в коде.")
+
+    if not ALLOWED_USER_ID or ALLOWED_USER_ID == "ТВОЙ_ТЕЛЕГРАМ_ID":
+        logger.critical("ALLOWED_USER_ID не задан или используется значение по умолчанию! Функции управления будут недоступны или доступны всем.")
+        # Можно либо завершить работу, либо продолжить с предупреждением.
+        # Для безопасности лучше завершить, если этот ID критичен для управления.
+        # sys.exit("Ошибка: ALLOWED_USER_ID не задан. Укажите ваш Telegram ID.")
+        logger.warning("ALLOWED_USER_ID не задан! Команды управления могут быть недоступны или небезопасны.")
+
+
+    logger.info(f"Запуск бота. SCRIPT_PATH: {SCRIPT_PATH}, SCRIPT_DIR: {SCRIPT_DIR}")
+    logger.info(f"Разрешенный пользователь ID: {ALLOWED_USER_ID}")
+
+    # Создание Application
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
     # Регистрация обработчиков
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CallbackQueryHandler(button_callback_handler))
-    # Добавьте другие обработчики здесь, если они нужны
+    application.add_handler(CommandHandler("menu", menu_command_handler))
+    application.add_handler(CallbackQueryHandler(button_callback))
 
-    application.add_error_handler(error_handler)
+    # Тут могут быть другие ваши обработчики сообщений, если они есть
+    # application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo_message_handler))
 
     # Запуск бота
-    logger.info(f"Бот запускается для пользователя ID {ALLOWED_USER_ID}...")
-    # run_polling() будет работать, пока вы не остановите скрипт (например, Ctrl+C)
-    # allowed_updates можно указать, чтобы получать только нужные типы обновлений
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-    # logger.info("Бот остановлен.") # Этот лог не будет достигнут при нормальной работе run_polling
+    logger.info(f"Бот запускается и ожидает команд...")
+    try:
+        application.run_polling()
+    except Exception as e:
+        logger.critical(f"Критическая ошибка при запуске или работе application.run_polling(): {e}", exc_info=True)
+    finally:
+        logger.info("Бот остановлен.")
+
 
 if __name__ == '__main__':
+    # Для Windows PowerShell рекомендуется установить кодировку перед запуском, если возникают проблемы с Unicode в консоли:
+    # $env:PYTHONIOENCODING="UTF-8"
+    # python alt.py
+    #
+    # Для CMD:
+    # chcp 65001
+    # set PYTHONIOENCODING=UTF-8
+    # python alt.py
     main()
