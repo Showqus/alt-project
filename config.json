@@ -1,0 +1,12 @@
+{
+  "token": "5571710712:AAGuAAqCYgiXw8fAg3uaEq-dlNnFCcWFbas",
+  "password": "1979",
+  "debug": false,
+  "authorized_users": [
+    "1314664622"
+  ],
+  "programs": {
+    "Блокнот": "C:\\\\Windows\\\\System32\\\\notepad.exe",
+    "Калькулятор": "C:\\\\Windows\\\\System32\\\\calc.exe"
+  }
+}
