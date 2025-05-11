@@ -7,6 +7,7 @@ import telebot
 from telebot import types
 from datetime import datetime
 import sys
+import updater_git
 
 # === GUI в терминале ===
 os.system("title TelegramBot Console GUI")
@@ -138,18 +139,19 @@ def browser_search(message):
         bot.send_message(message.chat.id, f"❌ Ошибка при поиске: {e}")
 
 # === Кнопка: обновление бота ===
+
 @bot.message_handler(func=lambda m: m.text == "🔄 Обновить бота")
 def update_bot(message):
     if message.from_user.id not in AUTHORIZED_USERS:
         return
-    bot.send_message(message.chat.id, "🔁 Обновление началось...")
-    import updater
-    updater.backup_bot()
-    if updater.download_latest():
-        bot.send_message(message.chat.id, "✅ Обновление загружено. Перезапуск...")
-        updater.restart()
+    bot.send_message(message.chat.id, "🔁 Обновление через git...")
+    updater_git.backup_bot()
+    if updater_git.update_from_git():
+        bot.send_message(message.chat.id, "✅ Обновлено! Перезапуск...")
+        updater_git.restart()
     else:
-        bot.send_message(message.chat.id, "❌ Ошибка при обновлении.")
+        bot.send_message(message.chat.id, "❌ Ошибка или нет новых обновлений.")
+
 
 # === Назад ===
 @bot.message_handler(func=lambda m: m.text == "🔙 Назад")
