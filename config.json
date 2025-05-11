@@ -1,0 +1,8 @@
+{
+  "bot_token": "5571710712:AAGuAAqCYgiXw8fAg3uaEq-dlNnFCcWFbas",
+  "programs": {
+    "notepad": "C:\\Windows\\System32\\notepad.exe",
+    "calc": "C:\\Windows\\System32\\calc.exe"
+  },
+  "chromedriver_path": "C:\\Path\\To\\chromedriver.exe"
+}
