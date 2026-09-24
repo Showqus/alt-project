@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git clone --depth 1 https://github.com/ocornut/imgui:*)",
+      "Bash(git clone --depth 1 https://github.com/nlohmann/json:*)",
+      "Bash(git clone --depth 1 https://github.com/nothings/stb:*)"
+    ]
+  }
+}
