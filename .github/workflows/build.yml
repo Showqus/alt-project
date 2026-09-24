@@ -1,0 +1,50 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  msvc:
+    name: Windows (MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -A x64
+      - name: Build
+        run: cmake --build build --config Release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BedrockQoL-msvc
+          path: |
+            build/Release/BedrockQoL.dll
+            build/Release/BedrockQoLInjector.exe
+
+  mingw:
+    name: MinGW + smoke test (Wine)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mingw-w64 wine64 ninja-build
+      - name: Configure
+        run: cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-x86_64.cmake
+      - name: Build
+        run: cmake --build build
+      - name: Smoke test
+        working-directory: build
+        env:
+          WINEDEBUG: -all
+        run: |
+          /usr/lib/wine/wine64 wineboot -i || true
+          /usr/lib/wine/wine64 fake_game.exe BedrockQoL.dll
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BedrockQoL-mingw
+          path: |
+            build/BedrockQoL.dll
+            build/BedrockQoLInjector.exe
