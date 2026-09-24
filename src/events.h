@@ -12,6 +12,7 @@ namespace events {
 
 enum class Type {
     KeyPress,  // a key was pressed while in the world (binds, TextHotkey)
+    IgnoredKey,  // a key was pressed outside the world (cursor visible): bound keys tell why
     Command,   // a chat/control command, without prefix
     ConfigWrite,  // settings changed in the menu
 };

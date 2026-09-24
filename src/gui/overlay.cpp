@@ -60,7 +60,20 @@ std::atomic<int> g_directCount{0};
 std::atomic<int> g_otherCount{0};
 std::atomic<ID3D12CommandQueue*> g_queue{nullptr};
 std::atomic<ID3D12CommandQueue*> g_ownQueue{nullptr};  // the throw-away queue of HookD3D12 (not the game's)
-bool g_installed = false;  // worker thread
+std::atomic<bool> g_installed{false};  // written by the start thread
+
+// Menu set-up runs on its own thread: creating throw-away Direct3D devices can take long, or hang in
+// a driver, and must never hold up key binds and commands on the worker thread.
+HANDLE g_startThread = nullptr;
+std::atomic<bool> g_startRunning{false};
+std::atomic<const char*> g_step{""};
+ULONGLONG g_startBegan = 0;
+bool g_stuckReported = false;
+
+void Step(const char* what) {
+    g_step = what;
+    logx::Info("Menu: %s", what);
+}
 
 enum class Phase { Running, ShutdownRequested, Stopped };
 std::atomic<Phase> g_phase{Phase::Running};
@@ -72,6 +85,7 @@ std::unique_ptr<Renderer> g_renderer;
 IDXGISwapChain* g_failedSwapChain = nullptr;  // do not retry a swap chain that cannot be used
 bool g_imgui = false;
 bool g_firstFrameLogged = false;
+bool g_waitingForQueue = false;
 bool g_menuWasOpen = false;
 LARGE_INTEGER g_lastFrameTime{};
 LARGE_INTEGER g_frequency{};
@@ -82,7 +96,7 @@ std::atomic<HWND> g_window{nullptr};
 std::atomic<unsigned> g_width{0};
 std::atomic<unsigned> g_height{0};
 SRWLOCK g_statusLock = SRWLOCK_INIT;
-std::string g_status = "меню ещё не нарисовано: игра не показала ни одного кадра";
+std::string g_status = "меню ещё не запущено";
 
 thread_local int t_presentDepth = 0;
 
@@ -150,6 +164,13 @@ void SetStatus(const std::string& status) {
     ReleaseSRWLockExclusive(&g_statusLock);
 }
 
+// Set-up done: unless the render thread already created the menu (it may be faster than the set-up).
+void WaitingForFrame() {
+    AcquireSRWLockExclusive(&g_statusLock);
+    if (!g_rendererOk.load()) g_status = "меню ждёт первый кадр игры";
+    ReleaseSRWLockExclusive(&g_statusLock);
+}
+
 void DestroyAll() {
     g_rendererOk = false;
     if (g_renderer) g_renderer->Shutdown();
@@ -180,6 +201,10 @@ bool CreateAll(IDXGISwapChain* swapChain) {
             g_failedSwapChain = swapChain;
             logx::Error("Menu unavailable: %s", error.c_str());
             SetStatus("меню недоступно: " + error);
+        } else if (!g_waitingForQueue) {
+            g_waitingForQueue = true;
+            logx::Info("Menu: the game presents with Direct3D 12, waiting for its command queue");
+            SetStatus("меню ждёт очередь команд Direct3D 12 игры");
         }
         return false;
     }
@@ -208,8 +233,8 @@ bool CreateAll(IDXGISwapChain* swapChain) {
     g_window = g_renderer->Window();
     g_firstFrameLogged = false;
     logx::Info("Menu ready: %s", g_renderer->Details().c_str());
+    g_rendererOk = true;  // before the status: see WaitingForFrame
     SetStatus(std::string(g_renderer->Name()));
-    g_rendererOk = true;
     return true;
 }
 
@@ -234,6 +259,7 @@ bool DrawFrame(IDXGISwapChain* swapChain) {
     g_height = renderer.Height();
 
     if (!menu::WantsFrame() || renderer.Width() == 0 || renderer.Height() == 0) {
+        automation::NoFrame();
         g_menuWasOpen = false;
         g_lastFrameTime.QuadPart = 0;
         return false;
@@ -436,6 +462,7 @@ bool HookD3D11(HWND hwnd, int slot) {
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
     HRESULT hr = E_FAIL;
+    Step("creating a Direct3D 11 test device");
     for (D3D_DRIVER_TYPE type : {D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP}) {
         hr = D3D11CreateDeviceAndSwapChain(nullptr, type, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &desc, &chain,
                                            &device, nullptr, &context);
@@ -446,6 +473,7 @@ bool HookD3D11(HWND hwnd, int slot) {
         return false;
     }
 
+    Step("hooking Direct3D 11");
     void** vt = VTable(chain);
     bool ok = false;
     ok |= Hook(vt[kPresent], slot == 0 ? reinterpret_cast<void*>(&HookPresent<0>) : reinterpret_cast<void*>(&HookPresent<1>),
@@ -481,6 +509,7 @@ bool HookD3D12(HWND hwnd, int slot) {
     IDXGISwapChain1* chain = nullptr;
     bool ok = false;
 
+    Step("creating a Direct3D 12 test device");
     HRESULT hr = createDevice(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void**>(&device));
     D3D12_COMMAND_QUEUE_DESC queueDesc{};
     queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -497,9 +526,11 @@ bool HookD3D12(HWND hwnd, int slot) {
         desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         desc.BufferCount = 2;
         desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        Step("creating a Direct3D 12 test swap chain");
         hr = factory->CreateSwapChainForHwnd(queue, hwnd, &desc, nullptr, nullptr, &chain);
     }
     if (SUCCEEDED(hr)) {
+        Step("hooking Direct3D 12");
         void** vt = VTable(chain);
         ok |= Hook(vt[kPresent],
                    slot == 0 ? reinterpret_cast<void*>(&HookPresent<0>) : reinterpret_cast<void*>(&HookPresent<1>),
@@ -524,6 +555,7 @@ bool HookD3D12(HWND hwnd, int slot) {
         logx::Warn("Menu: Direct3D 12 test swap chain failed (0x%08lX)", static_cast<unsigned long>(hr));
     }
 
+    Step("releasing the Direct3D 12 test objects");
     g_ownQueue = queue;
     if (chain) chain->Release();
     if (factory) factory->Release();
@@ -536,6 +568,7 @@ bool HookD3D12(HWND hwnd, int slot) {
 }  // namespace
 
 bool Install() {
+    Step("creating a window for the Direct3D test devices");
     DummyWindow window;
     if (!window.hwnd) {
         logx::Error("Menu unavailable: could not create a window for the Direct3D test device");
@@ -546,6 +579,7 @@ bool Install() {
     // device is only created when the game does not (d3d12.dll may be loaded just to probe support).
     const bool d3d12 = HookD3D12(window.hwnd, 1);
     bool d3d11 = false;
+    if (d3d12) Step("waiting for the game's Direct3D 12 command queue");
     const ULONGLONG deadline = GetTickCount64() + 1500;
     while (d3d12 && !g_queue.load() && GetTickCount64() < deadline) Sleep(20);
     if (!g_queue.load()) d3d11 = HookD3D11(window.hwnd, 0);
@@ -556,7 +590,15 @@ bool Install() {
     }
     logx::Info("Menu: Present hooked (%s%s%s), waiting for the first frame", d3d11 ? "Direct3D 11" : "",
                d3d11 && d3d12 ? " + " : "", d3d12 ? "Direct3D 12" : "");
+    WaitingForFrame();
     return true;
+}
+
+DWORD WINAPI StartThread(LPVOID) {
+    Start();
+    g_step = "";
+    g_startRunning = false;
+    return 0;
 }
 
 bool Start() {
@@ -572,16 +614,16 @@ bool Start() {
                     "The log of that session is BedrockQoL.prev.log",
                     phase.c_str());
         config::Set("Menu", "Enabled", "0");
-        SetStatus("меню выключено: в прошлый раз игра закрылась, когда оно запускалось");
-        notify::Send("Меню BedrockQoL выключено: в прошлый раз игра закрылась с ошибкой, когда меню запускалось. "
-                     "Остальные функции работают. Включить меню: " + config::Prefix() +
+        SetStatus("меню выключено: в прошлый раз оно не смогло запуститься");
+        notify::Send("Меню BedrockQoL выключено: в прошлый раз игра закрылась (или меню зависло), пока меню "
+                     "запускалось. Бинды и команды работают. Включить меню: " + config::Prefix() +
                      "set Menu.Enabled 1. Пришлите разработчику файл BedrockQoL.prev.log из папки настроек.");
         return false;
     }
 
-    if (!g_stoppedEvent) g_stoppedEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     // Armed until the game has presented frames through the new hooks for a while (GuardTick).
     ArmGuard("setting up the menu hooks");
+    SetStatus("меню подключается к Direct3D");
     bool ok;
     {
         crashlog::Scope scope("setting up the menu hooks");
@@ -592,12 +634,48 @@ bool Start() {
     return ok;
 }
 
+void StartAsync() {
+    if (g_installed || g_startRunning.load()) return;
+    if (g_startThread) {
+        CloseHandle(g_startThread);
+        g_startThread = nullptr;
+    }
+    if (!g_stoppedEvent) g_stoppedEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_startRunning = true;
+    g_startBegan = GetTickCount64();
+    g_stuckReported = false;
+    g_startThread = CreateThread(nullptr, 0, &StartThread, nullptr, 0, nullptr);
+    if (!g_startThread) g_startRunning = false;
+}
+
+void Watch() {
+    if (!g_startRunning.load() || g_stuckReported || GetTickCount64() - g_startBegan < 10000) return;
+    g_stuckReported = true;
+    const char* step = g_step.load();
+    logx::Error("Menu: set-up has been running for 10 s, stuck at: %s", step);
+    SetStatus(std::string("меню не запустилось: подключение к Direct3D зависло (") + step + ")");
+    notify::Send(std::string("Меню BedrockQoL не запустилось: подключение к Direct3D зависло (шаг: ") + step +
+                 "). Бинды и команды работают. Пришлите разработчику BedrockQoL.log из папки настроек.");
+}
+
+bool Starting() { return g_startRunning.load(); }
+
+bool Started() { return g_installed.load() || g_startRunning.load(); }
+
 void OnProcessExit() { DisarmGuard(); }
 
-void Shutdown() {
+bool Shutdown() {
     SetMenuOpen(false);
+    // The set-up thread runs DLL code: it must be finished before the DLL may be unloaded.
+    bool safe = true;
+    if (g_startThread) {
+        safe = WaitForSingleObject(g_startThread, 3000) == WAIT_OBJECT_0;
+        if (!safe) logx::Error("Menu: the set-up thread is still stuck (%s)", g_step.load());
+        CloseHandle(g_startThread);
+        g_startThread = nullptr;
+    }
     DisarmGuard();  // a clean unload is not a crash
-    if (g_phase.load() == Phase::Stopped || !g_stoppedEvent) return;
+    if (g_phase.load() == Phase::Stopped || !g_stoppedEvent) return safe;
     g_phase = Phase::ShutdownRequested;
 
     // Let the render thread tear everything down on its next frame...
@@ -615,6 +693,7 @@ void Shutdown() {
     g_stoppedEvent = nullptr;
     DisarmGuard();
     logx::Info("Menu shut down");
+    return safe;
 }
 
 bool Ready() {

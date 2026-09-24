@@ -154,9 +154,9 @@ void HookKeyboardFeed(int key, int state) {
         zoom::OnKey(down, inWorld);
     }
 
-    if (pressed && inWorld) {
+    if (pressed && (inWorld || (!chat::IsOpen() && !gui::MenuOpen()))) {
         events::Event event;
-        event.type = events::Type::KeyPress;
+        event.type = inWorld ? events::Type::KeyPress : events::Type::IgnoredKey;
         event.vk = vk;
         events::Push(event);
     }
@@ -171,6 +171,7 @@ void HookMouseFeed(void* device, char button, char action, short x, short y, sho
         g_mouseX = x;
         g_mouseY = y;
         if (button >= 1 && button <= 3) g_mouseHeld[static_cast<int>(button)] = action != 0;
+        game::OnMouseMove(x, y, dx, dy);
         SyncMenu();
         if (gui::input::OnMouse(button, action, x, y, dx, dy)) return;
 

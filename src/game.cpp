@@ -8,6 +8,7 @@
 #include "chat.h"
 #include "config.h"
 #include "gui/state.h"
+#include "log.h"
 
 namespace game {
 namespace {
@@ -63,17 +64,56 @@ std::wstring DataDirectory() {
     return L".";
 }
 
-bool CursorHidden() {
+namespace {
+
+// Relative-movement check (input thread writes, any thread reads).
+std::atomic<bool> g_pointerLocked{false};
+std::atomic<bool> g_detectionWorks{false};
+int g_lastX = -1;
+int g_lastY = -1;
+
+bool SystemCursorHidden() {
     CURSORINFO info{};
     info.cbSize = sizeof(info);
-    if (!GetCursorInfo(&info)) return true;  // unknown: don't block features
-    return (info.flags & CURSOR_SHOWING) == 0;
+    if (!GetCursorInfo(&info)) return false;
+    // UWP hides the cursor by setting a null cursor: still "showing", but there is nothing to show.
+    return (info.flags & CURSOR_SHOWING) == 0 || info.hCursor == nullptr;
+}
+
+}  // namespace
+
+bool CursorHidden() {
+    const bool hidden = g_pointerLocked.load(std::memory_order_relaxed) || SystemCursorHidden();
+    if (hidden && !g_detectionWorks.exchange(true)) {
+        logx::Info("Cursor detection works (the game hid the cursor): binds only react in the world");
+    }
+    return hidden;
+}
+
+bool CursorDetectionWorks() { return g_detectionWorks.load(std::memory_order_relaxed); }
+
+void OnMouseMove(int x, int y, int dx, int dy) {
+    if (x != g_lastX || y != g_lastY) {
+        // The pointer moved on the screen: the game shows a screen with a cursor.
+        g_lastX = x;
+        g_lastY = y;
+        g_pointerLocked.store(false, std::memory_order_relaxed);
+    } else if (dx != 0 || dy != 0) {
+        // Movement without the pointer going anywhere: the game captured the mouse to turn the camera.
+        g_pointerLocked.store(true, std::memory_order_relaxed);
+    }
+}
+
+void OnScreenKey() { g_pointerLocked.store(false, std::memory_order_relaxed); }
+
+bool CursorAllowsWorld() {
+    if (!g_config.requireHiddenCursor) return true;
+    return CursorHidden() || !CursorDetectionWorks();
 }
 
 bool InWorld() {
     if (chat::IsOpen() || gui::MenuOpen()) return false;
-    if (!g_config.requireHiddenCursor) return true;
-    return CursorHidden();
+    return CursorAllowsWorld();
 }
 
 bool InWorldCached() {
@@ -94,6 +134,16 @@ bool HasFocus() {
     // UWP: the foreground window is ApplicationFrameHost's frame; the game's CoreWindow is its child.
     HWND core = FindWindowExW(fg, nullptr, L"Windows.UI.Core.CoreWindow", nullptr);
     return core && IsOurWindow(core);
+}
+
+double ProcessAgeSeconds() {
+    FILETIME created, exited, kernel, user, now;
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 1e9;
+    GetSystemTimeAsFileTime(&now);
+    const auto ticks = [](const FILETIME& t) {
+        return (static_cast<unsigned long long>(t.dwHighDateTime) << 32) | t.dwLowDateTime;
+    };
+    return static_cast<double>(ticks(now) - ticks(created)) / 1e7;
 }
 
 }  // namespace game

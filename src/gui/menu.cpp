@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 
+#include "../chat.h"
+#include "../commands.h"
 #include "../config.h"
 #include "../game.h"
 #include "../hooks.h"
@@ -83,6 +85,15 @@ Capture g_capture;
 bool g_captureButtonHovered = false;
 
 std::vector<Toast> g_toasts;
+
+// "Доступные команды" next to the chat (see UpdateHints).
+struct Hints {
+    bool visible = false;
+    std::string prefix;
+    std::vector<const commands::CommandInfo*> items;
+    bool functions = false;  // a listed command takes a function name
+};
+Hints g_hints;
 std::set<std::string> g_expanded;
 std::map<std::string, bool> g_cardHovered;
 
@@ -1274,6 +1285,84 @@ void DrawToasts() {
     }
 }
 
+// Which commands to list: the ones matching what is typed after the prefix in the chat, or all of
+// them for a while after .help.
+void UpdateHints() {
+    g_hints.visible = false;
+    g_hints.items.clear();
+    g_hints.functions = false;
+    if (MenuOpen()) return;
+
+    g_hints.prefix = config::Prefix();
+    bool typing = false;
+    bool complete = false;  // the command word is followed by a space
+    std::string word;
+    std::wstring typed;
+    if (g_config.chatCommands && chat::Typed(typed)) {
+        std::string line = text::Narrow(typed);
+        const size_t start = line.find_first_not_of(" \t");
+        line = start == std::string::npos ? "" : line.substr(start);
+        if (text::StartsWith(line, g_hints.prefix)) {
+            typing = true;
+            const std::string rest = line.substr(g_hints.prefix.size());
+            const size_t space = rest.find_first_of(" \t");
+            word = LowerUtf8(rest.substr(0, space));
+            complete = space != std::string::npos;
+        }
+    }
+    if (!typing && !CommandHintsRequested()) return;
+
+    for (const commands::CommandInfo& c : commands::CommandList()) {
+        bool match = word.empty();
+        for (const std::string& name : c.names) {
+            if (complete ? name == word : name.compare(0, word.size(), word) == 0) match = true;
+        }
+        if (!match) continue;
+        g_hints.items.push_back(&c);
+        g_hints.functions |= c.takesFunction;
+    }
+    g_hints.visible = !g_hints.items.empty();
+}
+
+// Chat-like box above the chat input, bottom left.
+void DrawHints() {
+    if (!g_hints.visible) return;
+    ImGuiIO& io = ImGui::GetIO();
+    const float s = S();
+    const float margin = 8.0f * s;
+    const float bottom = io.DisplaySize.y - std::max(64.0f * s, io.DisplaySize.y * 0.1f);
+    ImGui::SetNextWindowPos(ImVec2(margin, bottom), ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(0.0f, 0.0f),
+                                        ImVec2(io.DisplaySize.x * 0.7f, std::max(bottom - margin, 50.0f)));
+    // The menu's fade must not apply here: the list shows while the menu is closed.
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f * s, 6.0f * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f * s, 2.0f * s));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 0.6f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                                   ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+                                   ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+    if (ImGui::Begin("Доступные команды###commands", nullptr, flags)) {
+        const ImVec4 accent = g_theme.custom[kColAccent];
+        const ImVec4 gray(0.72f, 0.72f, 0.72f, 1.0f);
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "Доступные команды");
+        ImGui::SameLine();
+        ImGui::TextColored(gray, "(префикс %s)", g_hints.prefix.c_str());
+        for (const commands::CommandInfo* c : g_hints.items) {
+            ImGui::TextColored(accent, "%s%s", g_hints.prefix.c_str(), c->usage.c_str());
+            ImGui::SameLine();
+            ImGui::TextColored(gray, "- %s", c->description.c_str());
+        }
+        if (g_hints.functions) ImGui::TextColored(gray, "Функции: %s", commands::FunctionNames().c_str());
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(5);
+}
+
 }  // namespace
 
 void Init() {
@@ -1290,7 +1379,8 @@ bool WantsFrame() {
     g_toasts.erase(std::remove_if(g_toasts.begin(), g_toasts.end(),
                                   [now](const Toast& t) { return now - t.createdAt > 4500; }),
                    g_toasts.end());
-    return MenuOpen() || g_fade > 0.0f || !g_toasts.empty();
+    UpdateHints();
+    return MenuOpen() || g_fade > 0.0f || !g_toasts.empty() || g_hints.visible;
 }
 
 void BeginFrame(ImGuiIO& io) {
@@ -1350,6 +1440,7 @@ void BeginFrame(ImGuiIO& io) {
 void Draw() {
     const bool open = MenuOpen();
     g_captureButtonHovered = false;
+    DrawHints();
     DrawToasts();
     if (g_fade > 0.0f) {
         ImGuiIO& io = ImGui::GetIO();

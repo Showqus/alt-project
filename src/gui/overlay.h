@@ -15,12 +15,26 @@ namespace gui::overlay {
 // switches itself off and tells the player). Does nothing once it succeeded.
 bool Start();
 
+// Runs Start on its own thread (Direct3D test devices may take long or hang in a driver; key binds
+// and commands on the worker thread must not wait for them). Does nothing while it runs.
+void StartAsync();
+
+// Worker thread, periodically: tells the player if the set-up has been stuck for 10 seconds.
+void Watch();
+
+// The set-up thread is running.
+bool Starting();
+
+// Start was called (it is running, or it succeeded).
+bool Started();
+
 // The game is exiting normally (DllMain, DLL_PROCESS_DETACH): not a crash.
 void OnProcessExit();
 
 // Worker thread, before the hooks are removed: destroys the menu on the render thread (or here, if
-// the game stopped presenting) so no GPU object or ImGui state outlives the DLL.
-void Shutdown();
+// the game stopped presenting) so no GPU object or ImGui state outlives the DLL. Returns false if the
+// set-up thread is stuck inside a driver: then the DLL must stay loaded.
+bool Shutdown();
 
 // The menu can be shown: a renderer is set up and the game presented a frame recently.
 bool Ready();

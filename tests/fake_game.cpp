@@ -174,7 +174,13 @@ std::vector<uint32_t> g_captured;  // RGBA8, kWidth x kHeight
 void* g_presentFn = nullptr;       // IDXGISwapChain::Present used by the "game"
 HANDLE g_renderThread = nullptr;
 
+// Like the real game: an arrow cursor on screens, a null cursor (hidden, but Windows still reports it
+// as "showing") while the player is in the world. Set by the render thread, which owns the window.
+std::atomic<bool> g_cursorInWorld{false};
+HCURSOR g_arrow = nullptr;
+
 void PumpMessages() {
+    SetCursor(g_cursorInWorld ? nullptr : g_arrow);
     MSG msg;
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
         TranslateMessage(&msg);
@@ -434,6 +440,8 @@ DWORD WINAPI RenderThread(LPVOID) {
     wc.lpfnWndProc = DefWindowProcW;
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.lpszClassName = L"FakeMinecraft";
+    g_arrow = LoadCursorA(nullptr, IDC_ARROW);
+    wc.hCursor = g_arrow;
     RegisterClassW(&wc);
     RECT r{0, 0, static_cast<LONG>(kWidth), static_cast<LONG>(kHeight)};
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
@@ -443,7 +451,9 @@ DWORD WINAPI RenderThread(LPVOID) {
         g_rendererState = -1;
         return 0;
     }
-    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    // Foreground like a game the player looks at: GetCursorInfo reports the foreground thread's cursor.
+    ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
     if (g_useD3D12) {
         RunD3D12(hwnd);
     } else {
@@ -695,17 +705,20 @@ void Click(int x, int y) {
 
 // Clicks the middle of a widget of the menu (found by its ImGui label / "##id"), once its position
 // is stable (a window that just appeared or changed page settles within a few frames).
-bool ClickItem(const char* label) {
-    float r[4] = {};
+bool StableItem(const char* label, float* r) {
     float previous[4] = {-1, -1, -1, -1};
-    const bool found = WaitFor([&] {
+    return WaitFor([&] {
         if (!FindItem(label, r) || r[2] <= 0 || r[3] <= 0) return false;
-        const bool stable = std::memcmp(r, previous, sizeof(r)) == 0;
-        std::memcpy(previous, r, sizeof(r));
+        const bool stable = std::memcmp(r, previous, sizeof(previous)) == 0;
+        std::memcpy(previous, r, sizeof(previous));
         if (!stable) Sleep(60);
         return stable;
     }, 3000);
-    if (!found) return false;
+}
+
+bool ClickItem(const char* label) {
+    float r[4] = {};
+    if (!StableItem(label, r)) return false;
     if (std::getenv("FAKE_GAME_VERBOSE")) std::printf("  click %s at %.0f,%.0f %.0fx%.0f\n", label, r[0], r[1], r[2], r[3]);
     Click(static_cast<int>(r[0] + r[2] * 0.5f), static_cast<int>(r[1] + r[3] * 0.5f));
     Sleep(80);
@@ -753,6 +766,98 @@ std::wstring ExeDir() {
     GetModuleFileNameW(nullptr, path, MAX_PATH);
     std::wstring dir = path;
     return dir.substr(0, dir.find_last_of(L"\\/"));
+}
+
+bool Notified(const char* text) {
+    return WaitFor([&] { return FileContains(DataDir() + L"\\control\\notifications.txt", text); }, 3000);
+}
+
+// "Доступные команды" next to the chat, feedback for keys that do nothing, .status.
+void CommandListTests() {
+    // The prefix is ';' here (changed by the chat tests).
+    float all[4] = {}, some[4] = {};
+    Tap('T');
+    Type(";");
+    Check(StableItem("###commands", all), "typing the command prefix in the chat shows 'Доступные команды'");
+    if (std::getenv("FAKE_GAME_VERBOSE")) std::printf("  command list at %.0f,%.0f %.0fx%.0f\n", all[0], all[1], all[2], all[3]);
+    Check(all[0] < 40 && all[1] + all[3] > kHeight * 0.7f && all[3] > 200,
+          "the list sits bottom left, above the chat input, with every command");
+    Screenshot("8-commands");
+    Type("bi");
+    Check(WaitFor([&] { return StableItem("###commands", some) && some[3] < all[3] * 0.5f; }, 3000),
+          "typing ';bi' narrows the list to the matching commands");
+    Tap(VK_ESCAPE);
+    Check(WaitFor([] { return !FindItem("###commands"); }, 2000), "closing the chat hides the list");
+    Tap('T');
+    Type("hello");
+    Sleep(300);
+    Check(!FindItem("###commands"), "normal chat text shows no list");
+    Tap(VK_ESCAPE);
+    Tap('T');
+    Type(";zzz");
+    Sleep(300);
+    Check(!FindItem("###commands"), "an unknown command shows no list");
+    Tap(VK_ESCAPE);
+
+    Check(!Chat(";help"), ";help is not sent to the server");
+    Check(WaitFor([] { return FindItem("###commands"); }, 2000), ";help shows the list after the chat closed");
+    Check(Notified("\xD0\x94\xD0\xBE\xD1\x81\xD1\x82\xD1\x83\xD0\xBF\xD0\xBD\xD1\x8B\xD0\xB5 "
+                   "\xD0\xBA\xD0\xBE\xD0\xBC\xD0\xB0\xD0\xBD\xD0\xB4\xD1\x8B (\xD0\xBF\xD1\x80\xD0\xB5\xD1\x84"
+                   "\xD0\xB8\xD0\xBA\xD1\x81 ;)"),  // "Доступные команды (префикс ;)"
+          ";help also goes to the launcher notifications");
+    Tap('T');
+    Tap(VK_ESCAPE);
+    Check(WaitFor([] { return !FindItem("###commands") && IsClear(Capture(), 400, 300); }, 2000),
+          "opening and closing the chat dismisses it");
+
+    // Menu key while the menu cannot open: the player is told why.
+    Commands("set Menu.Enabled 0\n");
+    const unsigned insertDowns = g_keyDowns[VK_INSERT];
+    Tap(VK_INSERT);
+    Check(g_keyDowns[VK_INSERT] == insertDowns + 1 &&
+              Notified("\xD0\x9C\xD0\xB5\xD0\xBD\xD1\x8E \xD0\xB2\xD1\x8B\xD0\xBA\xD0\xBB\xD1\x8E\xD1\x87"
+                       "\xD0\xB5\xD0\xBD\xD0\xBE ([Menu] Enabled=0)"),  // "Меню выключено ([Menu] Enabled=0)"
+          "INSERT with the menu switched off explains why (and the key goes to the game)");
+    Commands("set Menu.Enabled 1\n");
+    Check(WaitFor([] { Tap(VK_INSERT); return WaitFor([] { return FindItem("BedrockQoL"); }, 500); }, 5000),
+          "the menu opens again after Menu.Enabled 1");
+    Tap(VK_ESCAPE);
+    WaitFor([] { return IsClear(Capture(), 400, 300); }, 2000);
+
+    Check(!Chat(";status") && Notified("\xD0\x9A\xD0\xBB\xD0\xB0\xD0\xB2\xD0\xB8\xD0\xB0\xD1\x82\xD1\x83\xD1\x80"
+                                       "\xD0\xB0: \xD1\x85\xD1\x83\xD0\xBA \xD1\x80\xD0\xB0\xD0\xB1\xD0\xBE\xD1\x82"
+                                       "\xD0\xB0\xD0\xB5\xD1\x82"),  // "Клавиатура: хук работает"
+          ";status reports the keyboard hook");
+
+    // RequireHiddenCursor=1 (the default): binds only work in the world, told apart by the cursor.
+    Commands("set General.RequireHiddenCursor 1\n");
+    const float gamma = Gamma();
+    Tap('K');
+    Check(WaitFor([&] { return !Near(Gamma(), gamma); }, 2000),
+          "the game never hid the cursor yet: the cursor cannot tell, bound K still works");
+    g_cursorInWorld = true;  // null cursor, as the UWP game does: flags still say "showing"
+    Sleep(100);
+    Tap('K');
+    Check(WaitFor([&] { return Near(Gamma(), gamma); }, 2000), "null cursor (in the world): K works");
+    g_cursorInWorld = false;  // a game screen with an arrow
+    Sleep(100);
+    Tap('K');
+    Sleep(300);
+    Check(Near(Gamma(), gamma), "arrow cursor (a game screen is open): K is ignored");
+    Check(Notified("K (Fullbright)"), "the player is told once why K did nothing");
+    // Some systems show an arrow even in the world; the game then reports only relative movement.
+    fake_mouseFeed(nullptr, 0, 0, 400, 300, 5, 0, 0);
+    fake_mouseFeed(nullptr, 0, 0, 400, 300, 3, -2, 0);
+    Tap('K');
+    Check(WaitFor([&] { return !Near(Gamma(), gamma); }, 2000), "mouse captured by the game (relative movement): K works");
+    MouseMove(420, 310);  // the pointer moves on a screen again
+    Tap('K');
+    Sleep(300);
+    Check(!Near(Gamma(), gamma), "pointer moving on a screen: K is ignored again");
+    fake_mouseFeed(nullptr, 0, 0, 420, 310, 4, 4, 0);
+    Tap('K');
+    Check(WaitFor([&] { return Near(Gamma(), gamma); }, 2000), "back in the world: K works again");
+    Commands("set General.RequireHiddenCursor 0\n");
 }
 
 void MenuTests(HMODULE module) {
@@ -901,6 +1006,8 @@ void MenuTests(HMODULE module) {
     Check(WaitFor([] { return !IsClear(Capture(), 400, 300); }, 2000), "the menu command opens the menu");
     Tap(VK_INSERT);
     Check(WaitFor([] { return IsClear(Capture(), 400, 300); }, 2000), "INSERT closes it again");
+
+    CommandListTests();
     Commands("set Menu.Notifications 0\n");
 }
 

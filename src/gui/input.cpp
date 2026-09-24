@@ -7,6 +7,7 @@
 
 #include "../chat.h"
 #include "../config.h"
+#include "../events.h"
 #include "../game.h"
 #include "../hooks.h"
 #include "../keys.h"
@@ -186,7 +187,17 @@ bool OnKey(int vk, bool down, bool pressed) {
         if (!overlay::Ready()) {
             if (!g_hinted) {
                 g_hinted = true;
-                logx::Warn("Menu key pressed, but the menu cannot be drawn (no Direct3D hook yet, see the log above)");
+                logx::Warn("Menu key pressed, but the menu cannot be drawn: %s", overlay::Status().c_str());
+            }
+            // The .menu command tells the player why (at most every 2 seconds).
+            static ULONGLONG lastExplained = 0;
+            const ULONGLONG now = GetTickCount64();
+            if (lastExplained == 0 || now - lastExplained > 2000) {
+                lastExplained = now;
+                events::Event event;
+                event.type = events::Type::Command;
+                event.text = "menu";
+                events::Push(event);
             }
             return false;
         }

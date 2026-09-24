@@ -23,7 +23,7 @@ void Init(const std::wstring& dataDirectory) {
     if (FILE* f = _wfopen(g_path.c_str(), L"wb")) fclose(f);
 }
 
-void Send(const std::string& message) {
+void Send(const std::string& message, bool toast) {
     // One notification per line; embedded newlines are escaped as "\n".
     std::string line;
     for (char c : message) {
@@ -35,7 +35,7 @@ void Send(const std::string& message) {
     }
 
     logx::Info("[notify] %s", message.c_str());
-    gui::PushToast(message);
+    if (toast) gui::PushToast(message);
     if (g_path.empty()) return;
 
     AcquireSRWLockExclusive(&g_lock);

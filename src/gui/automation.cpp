@@ -63,6 +63,13 @@ void EndFrame() {
     ReleaseSRWLockExclusive(&g_lock);
 }
 
+void NoFrame() {
+    if (!g_enabled.load(std::memory_order_relaxed)) return;
+    AcquireSRWLockExclusive(&g_lock);
+    g_lastFrame.clear();
+    ReleaseSRWLockExclusive(&g_lock);
+}
+
 }  // namespace gui::automation
 
 // --- ImGui test engine hooks (IMGUI_ENABLE_TEST_ENGINE) -------------------------------------

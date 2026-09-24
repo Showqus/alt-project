@@ -80,17 +80,6 @@ void RunControlCommands() {
     }
 }
 
-// Seconds since the game process started.
-double ProcessAgeSeconds() {
-    FILETIME created, exited, kernel, user, now;
-    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 1e9;
-    GetSystemTimeAsFileTime(&now);
-    const auto ticks = [](const FILETIME& t) {
-        return (static_cast<unsigned long long>(t.dwHighDateTime) << 32) | t.dwLowDateTime;
-    };
-    return static_cast<double>(ticks(now) - ticks(created)) / 1e7;
-}
-
 // Edge detection on top of GetAsyncKeyState for the polling fallback.
 class KeyPoller {
 public:
@@ -116,7 +105,7 @@ void WorkerLoop(HANDLE unloadEvent) {
     ULONGLONG lastControlCheck = 0;
     std::string menuStatus = "unavailable";
     bool menuEnabled = cfg.menuEnabled;
-    bool menuStarted = false;  // gui::overlay::Start was called (it runs once the game had time to set up)
+    bool menuStarted = false;  // gui::overlay::StartAsync was called (once the game had time to set up)
 
     while (WaitForSingleObject(unloadEvent, 10) == WAIT_TIMEOUT) {
         events::Event event;
@@ -126,6 +115,8 @@ void WorkerLoop(HANDLE unloadEvent) {
             } else if (event.type == events::Type::ConfigWrite) {
                 gui::SetAppliedWrite(event.writeId);  // reported by the snapshot published after the reload
                 config::Apply(event.entries);
+            } else if (event.type == events::Type::IgnoredKey) {
+                commands::OnIgnoredKey(event.vk);
             } else {
                 commands::OnKeyPress(event.vk);
             }
@@ -141,13 +132,15 @@ void WorkerLoop(HANDLE unloadEvent) {
             lastControlCheck = now;
             RunControlCommands();
             // The menu hooks Direct3D once the game has had time to set up its own renderer, and again
-            // when [Menu] Enabled is switched on while the game runs (e.g. after the crash guard).
+            // when [Menu] Enabled is switched on while the game runs (e.g. after the crash guard). The
+            // set-up runs on its own thread: binds and commands keep working even if a driver hangs.
             if (cfg.menuEnabled && !menuEnabled) menuStarted = false;
             menuEnabled = cfg.menuEnabled;
-            if (!menuStarted && ProcessAgeSeconds() >= cfg.menuStartDelay) {
+            if (!menuStarted && game::ProcessAgeSeconds() >= cfg.menuStartDelay) {
                 menuStarted = true;
-                gui::overlay::Start();
+                gui::overlay::StartAsync();
             }
+            gui::overlay::Watch();
             const std::string menu = gui::overlay::Ready() ? gui::overlay::Status() : "unavailable";
             if (menu != menuStatus) {
                 menuStatus = menu;
@@ -183,16 +176,25 @@ void WorkerLoop(HANDLE unloadEvent) {
         for (int vk = 1; vk < 256; ++vk) poller.Update(vk);
         const bool inWorld = focused && game::InWorld();
         if (focused && poller.Pressed(cfg.menuKey) && cfg.menuKey > 0) {
-            gui::SetMenuOpen(!gui::MenuOpen() && gui::overlay::Ready());
+            if (gui::MenuOpen() || gui::overlay::Ready()) {
+                gui::SetMenuOpen(!gui::MenuOpen());
+            } else {
+                commands::Execute("menu");  // says why the menu cannot open
+            }
         }
         if (focused && !gui::MenuOpen() && poller.Pressed(cfg.unloadKey)) {
             SetEvent(unloadEvent);
             break;
         }
         if (poller.Changed(cfg.zoomKey)) zoom::OnKey(focused && poller.Down(cfg.zoomKey), inWorld);
-        if (inWorld) {
+        if (focused && !gui::MenuOpen()) {
             for (int vk = 1; vk < 256; ++vk) {
-                if (poller.Pressed(vk)) commands::OnKeyPress(vk);
+                if (!poller.Pressed(vk)) continue;
+                if (inWorld) {
+                    commands::OnKeyPress(vk);
+                } else {
+                    commands::OnIgnoredKey(vk);
+                }
             }
         }
         autosprint::PollFallback(focused, inWorld);
@@ -226,11 +228,19 @@ DWORD WINAPI MainThread(LPVOID param) {
     }
 
     logx::Info("Unloading...");
-    gui::overlay::Shutdown();
+    const bool menuStopped = gui::overlay::Shutdown();
     autosprint::ReleaseFallback();
     zoom::Reset();
     hooks::Uninstall();
     DeleteFileW(ControlPath(L"status.txt").c_str());
+    if (!menuStopped) {
+        // The menu set-up thread is stuck inside a driver and still runs our code: keep the DLL loaded
+        // (everything else is switched off) instead of pulling the code from under it.
+        logx::Warn("Unloaded, but the DLL stays in memory until the game closes (menu set-up is stuck)");
+        crashlog::Uninstall();
+        logx::Shutdown();
+        ExitThread(0);
+    }
     logx::Info("Unloaded");
     crashlog::Uninstall();
     logx::Shutdown();

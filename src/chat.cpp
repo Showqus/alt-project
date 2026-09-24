@@ -8,6 +8,7 @@
 #include "config.h"
 #include "events.h"
 #include "game.h"
+#include "gui/state.h"
 #include "keys.h"
 #include "log.h"
 #include "text.h"
@@ -27,6 +28,22 @@ std::wstring g_buffer;
 size_t g_cursor = 0;
 ULONGLONG g_openedAt = 0;
 
+// What the player is typing, for the command hints next to the chat (render thread).
+SRWLOCK g_publishLock = SRWLOCK_INIT;
+std::wstring g_published;
+bool g_publishedValid = false;
+
+void Publish() {
+    AcquireSRWLockExclusive(&g_publishLock);
+    g_publishedValid = g_open.load() && g_valid;
+    if (g_publishedValid) {
+        g_published = g_buffer;
+    } else {
+        g_published.clear();
+    }
+    ReleaseSRWLockExclusive(&g_publishLock);
+}
+
 bool IsWordChar(wchar_t c) { return c != L' ' && c != L'\t'; }
 
 void Open(const std::wstring& initial) {
@@ -36,6 +53,7 @@ void Open(const std::wstring& initial) {
     g_buffer = initial;
     g_cursor = g_buffer.size();
     g_openedAt = GetTickCount64();
+    game::OnScreenKey();
 }
 
 void ClearIfSelected() {
@@ -120,17 +138,17 @@ void TrackModifiers(int vk, bool down) {
     }
 }
 
-bool OnKey(int vk, bool down, KeyFeedFn feed) {
-    TrackModifiers(vk, down);
-    if (!down) return false;
+namespace {
 
+// A key went down (OnKey): tracks the chat. Returns true if the key must be swallowed.
+bool HandleKey(int vk, KeyFeedFn feed) {
     if (g_open && g_config.requireHiddenCursor && game::CursorHidden() && GetTickCount64() - g_openedAt > 400) {
         // The chat was closed some other way (mouse click on "X", screen change...).
         g_open = false;
     }
 
     if (!g_open) {
-        const bool canOpen = !g_config.requireHiddenCursor || game::CursorHidden();
+        const bool canOpen = game::CursorAllowsWorld();
         if (canOpen && !g_ctrl && !g_alt) {
             if (vk == g_config.chatOpenKey) {
                 Open(L"");
@@ -143,7 +161,10 @@ bool OnKey(int vk, bool down, KeyFeedFn feed) {
 
     const bool ctrlOnly = g_ctrl && !g_alt;
     switch (vk) {
-        case VK_ESCAPE: g_open = false; return false;
+        case VK_ESCAPE:
+            g_open = false;
+            gui::ShowCommandHints(0);  // the player is done with the chat: hide the .help list too
+            return false;
         case VK_RETURN: return Submit(feed);
         case VK_BACK:
             if (g_selectAll) {
@@ -208,10 +229,30 @@ bool OnKey(int vk, bool down, KeyFeedFn feed) {
     return false;
 }
 
+}  // namespace
+
+bool OnKey(int vk, bool down, KeyFeedFn feed) {
+    TrackModifiers(vk, down);
+    if (!down) return false;
+    const bool swallow = HandleKey(vk, feed);
+    Publish();
+    return swallow;
+}
+
 void OnMouseClick() {
-    if (g_open) g_valid = false;
+    if (!g_open) return;
+    g_valid = false;
+    Publish();
 }
 
 bool IsOpen() { return g_open.load(std::memory_order_relaxed); }
+
+bool Typed(std::wstring& out) {
+    AcquireSRWLockShared(&g_publishLock);
+    const bool valid = g_publishedValid;
+    out = g_published;
+    ReleaseSRWLockShared(&g_publishLock);
+    return valid && IsOpen();
+}
 
 }  // namespace chat

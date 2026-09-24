@@ -9,4 +9,7 @@ namespace gui::automation {
 void BeginFrame();
 void EndFrame();
 
+// Render thread: nothing is drawn this frame, so no widget is visible.
+void NoFrame();
+
 }  // namespace gui::automation

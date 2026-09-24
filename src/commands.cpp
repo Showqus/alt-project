@@ -9,7 +9,9 @@
 #include <vector>
 
 #include "config.h"
+#include "chat.h"
 #include "features/texthotkey.h"
+#include "game.h"
 #include "gui/overlay.h"
 #include "gui/state.h"
 #include "gui/theme.h"
@@ -67,14 +69,7 @@ const Function* FindFunction(const std::string& name) {
     return nullptr;
 }
 
-std::string FunctionList() {
-    std::string out;
-    for (const Function& f : kFunctions) {
-        if (!out.empty()) out += ", ";
-        out += f.name;
-    }
-    return out;
-}
+std::string FunctionList() { return FunctionNames(); }
 
 // Key name from chat: "K", "F6", "CTRL", or a letter typed on another layout ("л" = the K key).
 int ParseKey(const std::string& token) {
@@ -149,17 +144,47 @@ std::string Join(const std::vector<std::string>& args, size_t from) {
 
 void Help() {
     const std::string p = config::Prefix();
-    notify::Send("Команды BedrockQoL (префикс " + p + "):\n" +
-                 p + "bind <клавиша> <функция>, " + p + "unbind <функция|клавиша>, " + p + "binds\n" +
-                 p + "toggle <функция>\n" +
-                 p + "prefix <новый префикс>\n" +
-                 p + "th add <клавиша> <текст>, " + p + "th remove <номер|клавиша>, " + p + "th list\n" +
-                 p + "config save|load|delete|export|import <имя>, " + p + "config list\n" +
-                 p + "menu (меню, клавиша " + keys::Name(g_config.menuKey) + "), " + p +
-                 "theme save|load|delete <имя>, " + p + "theme list|reset|preset <имя>\n" +
-                 p + "set <Секция.Ключ> <значение>, " + p + "get <Секция.Ключ>\n" +
-                 p + "unload, " + p + "version\n" +
-                 "Функции: " + FunctionList());
+    std::string out = "Доступные команды (префикс " + p + "):";
+    for (const CommandInfo& c : CommandList()) out += "\n" + p + c.usage + " - " + c.description;
+    out += "\nФункции: " + FunctionList();
+    // In the game the list shows next to the chat (a toast would be far too long).
+    notify::Send(out, false);
+    gui::ShowCommandHints(20000);
+}
+
+std::string YesNo(bool yes) { return yes ? "да" : "нет"; }
+
+// .status: what works and what does not, to find out why a key does nothing.
+void Status() {
+    const Config& c = g_config;
+    std::string out = std::string("Статус BedrockQoL ") + BEDROCKQOL_VERSION + ":";
+    out += "\nКлавиатура: ";
+    if (!hooks::HasKeyboardHook()) {
+        out += "хук не найден, опрос клавиш";
+    } else if (hooks::KeyboardFallback()) {
+        out += "хук молчит, опрос клавиш (команды в чате не работают)";
+    } else {
+        out += "хук работает (событий: " + std::to_string(hooks::KeyboardEventCount()) + ")";
+    }
+    out += "\nМышь: " + std::string(hooks::HasMouseHook() ? "хук работает" : "хук не найден");
+    out += "\nКурсор: ";
+    if (!c.requireHiddenCursor) {
+        out += "не проверяется (RequireHiddenCursor=0)";
+    } else if (!game::CursorDetectionWorks()) {
+        out += "игра ещё ни разу не скрыла его - бинды работают везде";
+    } else {
+        out += game::CursorHidden() ? "скрыт (в мире)" : "виден (открыт экран игры)";
+    }
+    out += ", чат открыт: " + YesNo(chat::IsOpen());
+    out += "\nМеню: " + std::string(!c.menuEnabled ? "выключено ([Menu] Enabled=0)"
+                                                    : gui::overlay::Ready() ? "работает" : "не готово") +
+           " - " + gui::overlay::Status() + ", клавиша " + keys::Name(c.menuKey);
+    out += "\nZoom: " + std::string(hooks::HasFovHook() ? "хук FOV есть" : "хук FOV не найден") +
+           ", клавиша " + keys::Name(c.zoomKey) + "; Fullbright: " +
+           (hooks::HasGammaHook() ? "хук яркости есть" : "хук яркости не найден");
+    out += "\nБинды: AutoSprint " + keys::Name(c.sprintToggleKey) + ", Fullbright " +
+           keys::Name(c.fullbrightToggleKey) + ", TextHotkey " + keys::Name(c.textHotkeyToggleKey);
+    notify::Send(out);
 }
 
 void Bind(const std::vector<std::string>& args) {
@@ -491,7 +516,14 @@ void MenuCmd() {
         return;
     }
     if (!gui::overlay::Ready()) {
-        notify::Send("Меню недоступно: " + gui::overlay::Status());
+        const double wait = g_config.menuStartDelay.load() - game::ProcessAgeSeconds();
+        if (!gui::overlay::Started() && wait > 0) {
+            notify::Send("Меню запустится через " + std::to_string(static_cast<int>(wait) + 1) +
+                         " с: сначала игра настраивает графику ([Menu] StartDelay)");
+        } else {
+            notify::Send("Меню пока не открывается: " + gui::overlay::Status() + ". Подробности: " +
+                         config::Prefix() + "status");
+        }
         return;
     }
     gui::SetMenuOpen(!gui::MenuOpen());
@@ -534,6 +566,8 @@ void Execute(const std::string& line) {
         MenuCmd();
     } else if (cmd == "theme" || cmd == "тема") {
         ThemeCmd(args);
+    } else if (cmd == "status" || cmd == "статус" || cmd == "debug") {
+        Status();
     } else if (cmd == "version" || cmd == "ver") {
         notify::Send(std::string("BedrockQoL ") + BEDROCKQOL_VERSION);
     } else if (const Function* f = FindFunction(cmd); f && f->enabledEntry) {
@@ -557,6 +591,69 @@ bool OnKeyPress(int vk) {
     }
     if (texthotkey::OnKeyPress(vk)) used = true;
     return used;
+}
+
+void OnIgnoredKey(int vk) {
+    static bool told = false;
+    if (told || vk <= 0) return;
+    std::string what;
+    for (const Function& f : kFunctions) {
+        if (f.enabledEntry && CurrentKey(f) == vk) what = f.title;
+    }
+    for (const TextHotkeyEntry& e : g_config.textHotkeys) {
+        if (what.empty() && e.key == vk) what = "TextHotkey #" + e.id;
+    }
+    if (what.empty()) return;
+    told = true;
+    logx::Info("Key %s (%s) ignored: the cursor is visible", keys::Name(vk).c_str(), what.c_str());
+    notify::Send("Клавиша " + keys::Name(vk) + " (" + what +
+                 ") не сработала: курсор мыши виден, поэтому мод считает, что открыт экран игры, а не мир. "
+                 "Если вы были в мире, выполните " + config::Prefix() + "set General.RequireHiddenCursor 0");
+}
+
+const std::vector<CommandInfo>& CommandList() {
+    static const std::vector<CommandInfo> list = [] {
+        // ".zoom" == ".toggle zoom" for the functions that can be switched on and off.
+        std::vector<std::string> toggles;
+        std::string toggleUsage;
+        for (const Function& f : kFunctions) {
+            if (!f.enabledEntry || std::string(f.name) == "texthotkey") continue;
+            toggleUsage += (toggleUsage.empty() ? "" : "|") + std::string(f.name);
+            toggles.push_back(f.name);
+            for (const char* alias : f.aliases) toggles.push_back(alias);
+        }
+        return std::vector<CommandInfo>{
+            {"help", "этот список", {"help", "?", "помощь"}},
+            {"menu", "открыть меню мода", {"menu", "gui", "clickgui", "меню"}},
+            {"bind <клавиша> <функция>", "назначить клавишу", {"bind", "b"}, true},
+            {"unbind <функция|клавиша>", "снять клавишу", {"unbind", "ub"}, true},
+            {"binds", "все назначенные клавиши", {"binds", "keybinds"}},
+            {"toggle <функция>", "включить или выключить", {"toggle", "t"}, true},
+            {toggleUsage, "то же, что toggle", toggles},
+            {"th add <клавиша> <текст>", "сообщение в чат по клавише", {"th", "texthotkey"}},
+            {"th list | remove <номер> | clear", "список и удаление TextHotkey", {"th", "texthotkey"}},
+            {"config save|load|delete|list <имя>", "профили настроек", {"config", "cfg"}},
+            {"config export|import <имя>", "обмен конфигами", {"config", "cfg"}},
+            {"theme preset|save|load|list <имя>", "темы меню", {"theme", "тема"}},
+            {"set <Секция.Ключ> <значение>", "изменить настройку config.ini", {"set"}},
+            {"get <Секция.Ключ>", "показать настройку", {"get"}},
+            {"prefix <символы>", "сменить префикс команд", {"prefix"}},
+            {"say <текст>", "отправить сообщение в чат", {"say"}},
+            {"status", "проверить, что работает", {"status", "статус", "debug"}},
+            {"version", "версия мода", {"version", "ver"}},
+            {"unload", "выгрузить мод", {"unload", "eject"}},
+        };
+    }();
+    return list;
+}
+
+const std::string& FunctionNames() {
+    static const std::string names = [] {
+        std::string out;
+        for (const Function& f : kFunctions) out += (out.empty() ? "" : ", ") + std::string(f.name);
+        return out;
+    }();
+    return names;
 }
 
 }  // namespace commands

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 // Tracks what the player types into the in-game chat, using only the key events that pass
 // through Keyboard::feed, so that messages starting with the command prefix (".bind ...")
 // can be run locally instead of being sent to the server.
@@ -20,5 +22,9 @@ void OnMouseClick();
 
 // True while the chat is (believed to be) open.
 bool IsOpen();
+
+// Any thread: the text typed into the open chat so far. False when the chat is closed or its text is
+// not known (history, autocomplete, mouse edits).
+bool Typed(std::wstring& out);
 
 }  // namespace chat

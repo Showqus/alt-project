@@ -37,6 +37,8 @@ enum MenuId : UINT {
     kMenuBackground,
     kMenuFont,
     kMenuAutostart,
+    kMenuStatus,
+    kMenuEnableMenu,
     kMenuExit,
 };
 
@@ -189,11 +191,30 @@ void ImportMenuFile(bool font) {
     }
 }
 
+// Status of the mod in the game, or switching its menu back on (e.g. after the crash guard turned it
+// off): the mod runs the command and reports back through a notification.
+void GameCommandOrConfig(const std::string& command, const wchar_t* section, const wchar_t* key, const wchar_t* value,
+                         const std::wstring& offlineMessage) {
+    const DWORD pid = FindProcess(g_settings.processName);
+    if (pid && !LoadedModDll(pid).empty()) {
+        SendGameCommand(command);
+        return;
+    }
+    if (section) {
+        const std::wstring data = GameDataDirectory();
+        CreateDirectoryW(data.c_str(), nullptr);
+        WritePrivateProfileStringW(section, key, value, (data + L"\\config.ini").c_str());
+    }
+    ShowBalloon(offlineMessage);
+}
+
 void ShowMenu() {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, kMenuInject, L"Загрузить мод в игру");
     AppendMenuW(menu, MF_STRING, kMenuUpdate, L"Проверить обновления");
     AppendMenuW(menu, MF_STRING, kMenuUnload, L"Выгрузить мод из игры");
+    AppendMenuW(menu, MF_STRING, kMenuStatus, L"Проверить мод (что работает)");
+    AppendMenuW(menu, MF_STRING, kMenuEnableMenu, L"Включить меню в игре");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kMenuOpenFolder, L"Открыть папку настроек");
     AppendMenuW(menu, MF_STRING, kMenuImport, L"Импорт конфига...");
@@ -240,6 +261,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case kMenuBackground: ImportMenuFile(false); break;
                 case kMenuFont: ImportMenuFile(true); break;
                 case kMenuAutostart: SetAutostart(!AutostartEnabled()); break;
+                case kMenuStatus:
+                    GameCommandOrConfig("status", nullptr, nullptr, nullptr, L"Мод не загружен в игру");
+                    break;
+                case kMenuEnableMenu:
+                    GameCommandOrConfig("set Menu.Enabled 1", L"Menu", L"Enabled", L"1",
+                                        L"Меню включено: оно появится при следующем запуске мода");
+                    break;
                 case kMenuExit: DestroyWindow(hwnd); break;
                 default: break;
             }

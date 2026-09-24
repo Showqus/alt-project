@@ -13,6 +13,7 @@ std::shared_ptr<const Snapshot> g_snapshot = std::make_shared<Snapshot>();
 std::atomic<uint64_t> g_appliedWrite{0};
 
 std::atomic<bool> g_menuOpen{false};
+std::atomic<ULONGLONG> g_hintsUntil{0};  // GetTickCount64 until which .help keeps the command list up
 
 SRWLOCK g_toastLock = SRWLOCK_INIT;
 std::deque<Toast> g_toasts;
@@ -43,6 +44,10 @@ std::shared_ptr<const Snapshot> Latest() {
     ReleaseSRWLockShared(&g_snapshotLock);
     return copy;
 }
+
+void ShowCommandHints(ULONGLONG milliseconds) { g_hintsUntil.store(GetTickCount64() + milliseconds); }
+
+bool CommandHintsRequested() { return GetTickCount64() < g_hintsUntil.load(std::memory_order_relaxed); }
 
 bool MenuOpen() { return g_menuOpen.load(std::memory_order_relaxed); }
 

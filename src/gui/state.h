@@ -44,6 +44,10 @@ struct Toast {
 void PushToast(const std::string& utf8);
 void TakeToasts(std::vector<Toast>& out);  // render thread: moves the queued toasts into `out`
 
+// "Доступные команды" next to the chat: shown while a command is typed, and for a while after .help.
+void ShowCommandHints(ULONGLONG milliseconds);
+bool CommandHintsRequested();
+
 // Render thread: settings changed in the menu are written by the worker thread in batches.
 void QueueWrite(const ConfigEntry& entry);
 void QueueWrites(const std::vector<ConfigEntry>& entries);
