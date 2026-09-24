@@ -70,10 +70,11 @@ jobs:
             build/BedrockQoLLauncher.exe
 
   # The launcher downloads release "latest" (manifest.txt + BedrockQoL.dll) and reloads the new DLL
-  # into the running game, so every push to main reaches players automatically.
+  # into the running game, so every push to main reaches players automatically. "Run workflow" by
+  # hand publishes the chosen branch.
   release:
     name: Publish "latest" release
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    if: (github.ref == 'refs/heads/main' && github.event_name == 'push') || github.event_name == 'workflow_dispatch'
     needs: [msvc, mingw]
     runs-on: ubuntu-24.04
     permissions:
@@ -93,7 +94,8 @@ jobs:
           printf 'version=%s\nfile=BedrockQoL.dll\nsha256=%s\n' "$VERSION" "$(sha256sum BedrockQoL.dll | cut -d' ' -f1)" > manifest.txt
           cat manifest.txt
           gh release delete latest --yes --cleanup-tag || true
-          gh release create latest BedrockQoL.dll BedrockQoLLauncher.exe manifest.txt \
+          # BedrockQoL.map decodes "CRASH: ... BedrockQoL.dll+0x..." lines of the log for this build.
+          gh release create latest BedrockQoL.dll BedrockQoLLauncher.exe manifest.txt BedrockQoL.map \
             --target "$GITHUB_SHA" --latest \
             --title "BedrockQoL $VERSION" \
-            --notes "Автоматическая сборка из коммита $GITHUB_SHA. BedrockQoLLauncher.exe скачивает её сам."
+            --notes "Сборка из ветки ${GITHUB_REF_NAME}, коммит $GITHUB_SHA. BedrockQoLLauncher.exe скачивает её сам."
