@@ -5,6 +5,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 struct ImDrawData;
 struct ID3D12CommandQueue;
@@ -31,6 +32,16 @@ public:
     // Destroys the ImGui backend and every GPU object (waits for the GPU).
     virtual void Shutdown() = 0;
 
+    // The swap chain still belongs to the device this renderer was made for (the game may recreate
+    // its device and get a new swap chain at the same address).
+    virtual bool SameDevice(IDXGISwapChain* swapChain) const = 0;
+
+    // The device was removed (driver reset, or a bad command): nothing can be drawn with it any more.
+    virtual bool DeviceLost(HRESULT& reason) const = 0;
+
+    // "Direct3D 12, 1920x1080, format 28, 3 buffers, queue found in the swap chain" for the log.
+    virtual std::string Details() const = 0;
+
     IDXGISwapChain* SwapChain() const { return swapChain_; }
     HWND Window() const { return window_; }
     UINT Width() const { return width_; }
@@ -48,9 +59,11 @@ protected:
     UINT height_ = 0;
 };
 
-// Picks Direct3D 11 or 12 from the swap chain's device. A Direct3D 12 renderer needs the game's
-// command queue; while it is unknown this returns null with `retry` set.
-std::unique_ptr<Renderer> CreateRenderer(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, bool& retry,
-                                         std::string& error);
+// Picks Direct3D 11 or 12 from the swap chain's device. A Direct3D 12 renderer draws on the game's
+// command queue: the one the swap chain was created with if it is among `queues` (the game's direct
+// queues seen so far), otherwise `lastQueue`. While no queue of the swap chain's device is known,
+// this returns null with `retry` set.
+std::unique_ptr<Renderer> CreateRenderer(IDXGISwapChain* swapChain, const std::vector<ID3D12CommandQueue*>& queues,
+                                         ID3D12CommandQueue* lastQueue, bool& retry, std::string& error);
 
 }  // namespace gui

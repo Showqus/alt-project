@@ -32,7 +32,13 @@ const char kDefaultIni[] =
     "\n"
     "[Menu]\n"
     "; In-game menu (modules, key binds, appearance, configs). Also opens with the .menu command.\n"
+    "; Enabled=0 switches the menu (and in-game notifications) off; the mod sets it itself if the game\n"
+    "; crashed while the menu was starting.\n"
+    "Enabled=1\n"
     "Key=INSERT\n"
+    "; Seconds after the game started before the menu hooks Direct3D (the game sets up its own\n"
+    "; renderer first). The other features start right away.\n"
+    "StartDelay=20\n"
     "; Font file: empty = built-in (Roboto), a name from BedrockQoL\\fonts or C:\\Windows\\Fonts\n"
     "; (e.g. segoeui.ttf), or a full path. Size in pixels before Scale.\n"
     "Font=\n"
@@ -267,7 +273,10 @@ void Reload() {
 
     c.unloadKey = ReadKey("General", "UnloadKey", d.unloadKey);
     c.requireHiddenCursor = ReadBool("General", "RequireHiddenCursor", d.requireHiddenCursor);
+    c.menuEnabled = ReadBool("Menu", "Enabled", d.menuEnabled);
     c.menuKey = ReadKey("Menu", "Key", d.menuKey);
+    const float startDelay = ReadFloat("Menu", "StartDelay", static_cast<float>(d.menuStartDelay));
+    c.menuStartDelay = startDelay < 0.0f ? 0 : startDelay > 600.0f ? 600 : static_cast<int>(startDelay);
 
     c.chatCommands = ReadBool("Chat", "Commands", d.chatCommands);
     c.chatOpenKey = ReadKey("Chat", "OpenKey", d.chatOpenKey);

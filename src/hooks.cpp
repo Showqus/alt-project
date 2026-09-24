@@ -13,7 +13,6 @@
 #include "features/zoom.h"
 #include "game.h"
 #include "gui/input.h"
-#include "gui/overlay.h"
 #include "gui/state.h"
 #include "log.h"
 #include "scanner.h"
@@ -278,9 +277,6 @@ bool Install() {
         logx::Warn("Keyboard hook unavailable - using the polling fallback for keys (no chat commands)");
         g_keyboardFallback.store(true);
     }
-
-    // The in-game menu (IDXGISwapChain::Present).
-    gui::overlay::Install();
     return true;
 }
 

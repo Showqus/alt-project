@@ -66,6 +66,7 @@ jobs:
           name: BedrockQoL-mingw
           path: |
             build/BedrockQoL.dll
+            build/BedrockQoL.map
             build/BedrockQoLLauncher.exe
 
   # The launcher downloads release "latest" (manifest.txt + BedrockQoL.dll) and reloads the new DLL

@@ -5,6 +5,7 @@
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
 
+#include <cstdio>
 #include <vector>
 
 #include "../log.h"
@@ -56,34 +57,73 @@ DXGI_FORMAT TypedFormat(DXGI_FORMAT format) {
     }
 }
 
-// Windows.UI.Core.ICoreWindowInterop: the HWND behind a UWP CoreWindow (swap chains created with
-// CreateSwapChainForCoreWindow have no OutputWindow).
-struct ICoreWindowInteropBqol : public IUnknown {
-    virtual HRESULT STDMETHODCALLTYPE get_WindowHandle(HWND* hwnd) = 0;
-    virtual HRESULT STDMETHODCALLTYPE put_MessageHandled(unsigned char value) = 0;
-};
-const GUID kIID_ICoreWindowInterop = {0x45D64A29, 0xA63E, 0x4CB6, {0xB4, 0x98, 0x57, 0x81, 0xD2, 0x98, 0xCB, 0x4F}};
+// The game's window. Swap chains made with CreateSwapChainForCoreWindow (UWP) have no OutputWindow;
+// the CoreWindow object is not called from the render thread (it belongs to the UI thread), the
+// window is looked up instead: a visible window of this process, or its UWP CoreWindow.
+BOOL CALLBACK FindProcessWindow(HWND hwnd, LPARAM param) {
+    auto* found = reinterpret_cast<HWND*>(param);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == GetCurrentProcessId() && IsWindowVisible(hwnd)) {
+        *found = hwnd;
+        return FALSE;
+    }
+    if (HWND core = FindWindowExW(hwnd, nullptr, L"Windows.UI.Core.CoreWindow", nullptr)) {
+        GetWindowThreadProcessId(core, &pid);
+        if (pid == GetCurrentProcessId()) {
+            *found = core;
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
 
 HWND FindSwapChainWindow(IDXGISwapChain* swapChain) {
     DXGI_SWAP_CHAIN_DESC desc{};
     if (SUCCEEDED(swapChain->GetDesc(&desc)) && desc.OutputWindow) return desc.OutputWindow;
+    HWND found = nullptr;
+    EnumWindows(&FindProcessWindow, reinterpret_cast<LPARAM>(&found));
+    return found;
+}
 
-    HWND hwnd = nullptr;
-    IDXGISwapChain1* chain1 = nullptr;
-    if (SUCCEEDED(swapChain->QueryInterface(__uuidof(IDXGISwapChain1), reinterpret_cast<void**>(&chain1)))) {
-        IUnknown* core = nullptr;
-        if (SUCCEEDED(chain1->GetCoreWindow(__uuidof(IUnknown), reinterpret_cast<void**>(&core))) && core) {
-            ICoreWindowInteropBqol* interop = nullptr;
-            if (SUCCEEDED(core->QueryInterface(kIID_ICoreWindowInterop, reinterpret_cast<void**>(&interop)))) {
-                interop->get_WindowHandle(&hwnd);
-                interop->Release();
+bool Readable(const MEMORY_BASIC_INFORMATION& mbi) {
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return false;
+    return (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                           PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+}
+
+// DXGI keeps a pointer to the command queue a Direct3D 12 swap chain was created with inside the
+// swap chain object. Drawing on that queue (not just any direct queue of the game) keeps the menu's
+// commands ordered with the game's frame. Returns null if none of `queues` is found there.
+ID3D12CommandQueue* FindSwapChainQueue(IDXGISwapChain* swapChain, const std::vector<ID3D12CommandQueue*>& queues,
+                                       ptrdiff_t& offset) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (queues.empty() || !VirtualQuery(swapChain, &mbi, sizeof(mbi)) || !Readable(mbi)) return nullptr;
+    const uintptr_t object = reinterpret_cast<uintptr_t>(swapChain);
+    const uintptr_t regionBegin = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+    const uintptr_t regionEnd = regionBegin + mbi.RegionSize;
+    const uintptr_t begin = object - regionBegin > 0x400 ? object - 0x400 : regionBegin;
+    const uintptr_t end = regionEnd - object > 0x1000 ? object + 0x1000 : regionEnd;
+    for (uintptr_t p = begin & ~static_cast<uintptr_t>(7); p + sizeof(void*) <= end; p += sizeof(void*)) {
+        const void* value = *reinterpret_cast<void* const*>(p);
+        for (ID3D12CommandQueue* queue : queues) {
+            if (value == queue) {
+                offset = static_cast<ptrdiff_t>(p - object);
+                return queue;
             }
-            core->Release();
         }
-        if (!hwnd) chain1->GetHwnd(&hwnd);
-        chain1->Release();
     }
-    return hwnd;
+    return nullptr;
+}
+
+std::string FormatName(DXGI_FORMAT format) {
+    switch (format) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM: return "R8G8B8A8_UNORM";
+        case DXGI_FORMAT_B8G8R8A8_UNORM: return "B8G8R8A8_UNORM";
+        case DXGI_FORMAT_R10G10B10A2_UNORM: return "R10G10B10A2_UNORM";
+        case DXGI_FORMAT_R16G16B16A16_FLOAT: return "R16G16B16A16_FLOAT";
+        default: return "format " + std::to_string(static_cast<int>(format));
+    }
 }
 
 // --- Direct3D 11 ---------------------------------------------------------------------------
@@ -142,6 +182,26 @@ public:
         SafeRelease(device_);
     }
 
+    bool SameDevice(IDXGISwapChain* swapChain) const override {
+        ID3D11Device* device = nullptr;
+        if (FAILED(swapChain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&device)))) return false;
+        device->Release();
+        return device == device_;
+    }
+
+    bool DeviceLost(HRESULT& reason) const override {
+        reason = device_ ? device_->GetDeviceRemovedReason() : S_OK;
+        return FAILED(reason);
+    }
+
+    std::string Details() const override {
+        DXGI_SWAP_CHAIN_DESC desc{};
+        swapChain_->GetDesc(&desc);
+        return std::string(Name()) + ", " + std::to_string(desc.BufferDesc.Width) + "x" +
+               std::to_string(desc.BufferDesc.Height) + ", " + FormatName(desc.BufferDesc.Format) + ", " +
+               std::to_string(desc.BufferCount) + " buffer(s)";
+    }
+
 private:
     ID3D11Device* device_;  // owned reference
     ID3D11DeviceContext* context_ = nullptr;
@@ -154,8 +214,8 @@ class D3D12Renderer final : public Renderer {
 public:
     // No reference to the swap chain or its buffers is kept between frames: the game must stay free
     // to resize or recreate them (DXGI refuses a new swap chain for a window whose old one is alive).
-    D3D12Renderer(IDXGISwapChain3* swapChain, ID3D12Device* device, ID3D12CommandQueue* queue)
-        : Renderer(swapChain), chain3_(swapChain), device_(device), queue_(queue) {
+    D3D12Renderer(IDXGISwapChain3* swapChain, ID3D12Device* device, ID3D12CommandQueue* queue, std::string queueSource)
+        : Renderer(swapChain), chain3_(swapChain), device_(device), queue_(queue), queueSource_(std::move(queueSource)) {
         queue_->AddRef();
     }
     ~D3D12Renderer() override { Shutdown(); }
@@ -245,6 +305,26 @@ public:
     }
 
     void BeforeResize() override { WaitIdle(); }
+
+    bool SameDevice(IDXGISwapChain* swapChain) const override {
+        ID3D12Device* device = nullptr;
+        if (FAILED(swapChain->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&device)))) return false;
+        device->Release();
+        return device == device_;
+    }
+
+    bool DeviceLost(HRESULT& reason) const override {
+        reason = device_ ? device_->GetDeviceRemovedReason() : S_OK;
+        return FAILED(reason);
+    }
+
+    std::string Details() const override {
+        DXGI_SWAP_CHAIN_DESC desc{};
+        swapChain_->GetDesc(&desc);
+        return std::string(Name()) + ", " + std::to_string(desc.BufferDesc.Width) + "x" +
+               std::to_string(desc.BufferDesc.Height) + ", " + FormatName(desc.BufferDesc.Format) + ", " +
+               std::to_string(desc.BufferCount) + " buffers, " + queueSource_;
+    }
 
     void Shutdown() override {
         WaitIdle();
@@ -378,6 +458,7 @@ private:
     IDXGISwapChain3* chain3_;  // not owned, like swapChain_
     ID3D12Device* device_;     // owned reference
     ID3D12CommandQueue* queue_;
+    std::string queueSource_;
     ID3D12DescriptorHeap* srvHeap_ = nullptr;
     ID3D12DescriptorHeap* rtvHeap_ = nullptr;
     UINT srvSize_ = 0;
@@ -407,8 +488,8 @@ void Renderer::UpdateSize() {
     }
 }
 
-std::unique_ptr<Renderer> CreateRenderer(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, bool& retry,
-                                         std::string& error) {
+std::unique_ptr<Renderer> CreateRenderer(IDXGISwapChain* swapChain, const std::vector<ID3D12CommandQueue*>& queues,
+                                         ID3D12CommandQueue* lastQueue, bool& retry, std::string& error) {
     retry = false;
     ID3D11Device* device11 = nullptr;
     if (SUCCEEDED(swapChain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&device11)))) {
@@ -416,29 +497,46 @@ std::unique_ptr<Renderer> CreateRenderer(IDXGISwapChain* swapChain, ID3D12Comman
     }
 
     ID3D12Device* device12 = nullptr;
-    if (SUCCEEDED(swapChain->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&device12)))) {
-        IDXGISwapChain3* chain3 = nullptr;
-        if (FAILED(swapChain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void**>(&chain3)))) {
-            device12->Release();
-            error = "the Direct3D 12 swap chain has no IDXGISwapChain3";
-            return nullptr;
-        }
-        ID3D12Device* queueDevice = nullptr;
-        if (queue) queue->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&queueDevice));
-        const bool sameDevice = queueDevice == device12;
-        SafeRelease(queueDevice);
-        if (!sameDevice) {
-            chain3->Release();
-            device12->Release();
-            retry = true;  // the game's command queue has not been seen in ExecuteCommandLists yet
-            return nullptr;
-        }
-        chain3->Release();  // same object as `swapChain`, which the game keeps alive while presenting it
-        return std::make_unique<D3D12Renderer>(chain3, device12, queue);
+    if (FAILED(swapChain->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&device12)))) {
+        error = "the swap chain belongs to neither a Direct3D 11 nor a Direct3D 12 device";
+        return nullptr;
     }
+    IDXGISwapChain3* chain3 = nullptr;
+    if (FAILED(swapChain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void**>(&chain3)))) {
+        device12->Release();
+        error = "the Direct3D 12 swap chain has no IDXGISwapChain3";
+        return nullptr;
+    }
+    chain3->Release();  // same object as `swapChain`, which the game keeps alive while presenting it
 
-    error = "the swap chain belongs to neither a Direct3D 11 nor a Direct3D 12 device";
-    return nullptr;
+    // Only queues of the swap chain's own device can draw into its buffers.
+    auto sameDevice = [device12](ID3D12CommandQueue* queue) {
+        ID3D12Device* device = nullptr;
+        if (!queue || FAILED(queue->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&device)))) return false;
+        device->Release();
+        return device == device12;
+    };
+    std::vector<ID3D12CommandQueue*> candidates;
+    for (ID3D12CommandQueue* queue : queues) {
+        if (sameDevice(queue)) candidates.push_back(queue);
+    }
+    ptrdiff_t offset = 0;
+    ID3D12CommandQueue* queue = FindSwapChainQueue(swapChain, candidates, offset);
+    std::string source;
+    if (queue) {
+        char buffer[64];
+        snprintf(buffer, sizeof(buffer), "swap chain queue (at %+lld)", static_cast<long long>(offset));
+        source = buffer;
+    } else if (sameDevice(lastQueue)) {
+        queue = lastQueue;
+        source = "last direct queue of the game (" + std::to_string(candidates.size()) + " seen)";
+    }
+    if (!queue) {
+        device12->Release();
+        retry = true;  // the game's command queue has not been seen in ExecuteCommandLists yet
+        return nullptr;
+    }
+    return std::make_unique<D3D12Renderer>(chain3, device12, queue, source);
 }
 
 }  // namespace gui

@@ -27,7 +27,9 @@ struct Config {
     std::atomic<bool> requireHiddenCursor{true};
 
     // [Menu] (the appearance keys of [Menu] and [Theme] are parsed by gui::theme)
+    std::atomic<bool> menuEnabled{true};
     std::atomic<int> menuKey{0x2D};  // INSERT
+    std::atomic<int> menuStartDelay{20};  // seconds after the game started before Direct3D is touched
 
     // [Chat]
     std::atomic<bool> chatCommands{true};

@@ -604,6 +604,7 @@ void WriteTestConfig() {
     if (std::getenv("FAKE_GAME_DEFAULT_CONFIG")) return;  // let the DLL write its own default file
     WriteFile(DataDir() + L"\\config.ini",
               "[General]\nUnloadKey=END\nRequireHiddenCursor=0\n"
+              "[Menu]\nStartDelay=0\n"
               "[Chat]\nCommands=1\nPrefix=.\nOpenKey=T\nCommandKey=SLASH\n"
               "[AutoSprint]\nEnabled=1\nToggleKey=F8\nForwardKey=W\nSprintKey=CTRL\nFallbackSendInput=0\n"
               "[Zoom]\nEnabled=1\nKey=C\nToggle=0\nFactor=4.0 ; inline comment\nMinFactor=1.5\nMaxFactor=50\n"
@@ -903,6 +904,57 @@ void MenuTests(HMODULE module) {
     Commands("set Menu.Notifications 0\n");
 }
 
+// The previous game session died while the menu was starting: the DLL must switch the menu off
+// instead of crashing again, tell the player, keep the old log, and come back on request.
+void SafeModeTests(const char* dll) {
+    const std::wstring log = DataDir() + L"\\BedrockQoL.log";
+    const std::wstring guard = DataDir() + L"\\control\\menu_guard.txt";
+    WriteFile(guard, "creating the menu renderer");
+    HMODULE module = LoadLibraryA(dll);
+    Check(module != nullptr, "DLL loads again after a crash during the menu start");
+    Check(WaitFor([&] { return FileContains(log, "previous game session ended while creating the menu renderer"); },
+                  5000),
+          "crash guard found: the menu is switched off");
+    Check(WaitIni("Menu", "Enabled", "0"), "[Menu] Enabled=0 saved");
+    Check(WaitFor([] { return FileContains(DataDir() + L"\\control\\notifications.txt",
+                                           "\xD0\x9C\xD0\xB5\xD0\xBD\xD1\x8E BedrockQoL"); },  // "Меню BedrockQoL"
+                  3000),
+          "the player is told the menu was switched off");
+    Check(FileContains(DataDir() + L"\\BedrockQoL.prev.log", "] Unloaded"),
+          "the log of the previous session is kept as BedrockQoL.prev.log");
+    WaitFor([&] { return FileContains(log, "] Ready."); }, 5000);
+
+    const unsigned insertDowns = g_keyDowns[VK_INSERT];
+    Tap(VK_INSERT);
+    Sleep(300);
+    Check(g_keyDowns[VK_INSERT] == insertDowns + 1 && IsClear(Capture(), 400, 300),
+          "menu switched off: INSERT goes to the game, nothing is drawn");
+    Check(Near(Fov(90.0f), 90.0f) && WaitFor([] { Key('V', true); return Near(Fov(90.0f), 22.5f); }, 2000),
+          "the other features keep working (zoom on V)");
+    Key('V', false);
+
+    if (g_useD3D12) {  // see main(): no DXGI factory while a Direct3D 12 frame is presented under Wine
+        g_renderPause = true;
+        WaitFor([] { return g_renderPaused.load(); }, 2000);
+        Sleep(300);
+    }
+    Commands("set Menu.Enabled 1\n");
+    if (g_useD3D12) {
+        WaitFor([&] { return FileContains(log, "Menu: Present hooked") || FileContains(log, "Menu unavailable"); },
+                20000);
+        g_renderPause = false;
+    }
+    Check(WaitFor([] { return FileContains(DataDir() + L"\\control\\status.txt", "menu=Direct3D"); }, 5000),
+          "Menu.Enabled 1 brings the menu back without restarting the game");
+    Tap(VK_INSERT);
+    Check(WaitFor([] { return !IsClear(Capture(), 400, 300); }, 3000), "the menu opens again");
+    Tap(VK_ESCAPE);
+
+    Commands("unload\n");
+    Check(WaitFor([] { return GetModuleHandleA("BedrockQoL.dll") == nullptr; }, 5000), "unloads again");
+    Check(GetFileAttributesW(guard.c_str()) == INVALID_FILE_ATTRIBUTES, "no crash guard is left after a clean unload");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -928,6 +980,7 @@ int main(int argc, char** argv) {
     Check(rendering, "fake game renders frames (swap chain created)");
     WriteTestConfig();
     DeleteFileW((DataDir() + L"\\control\\commands.txt").c_str());
+    DeleteFileW((DataDir() + L"\\control\\menu_guard.txt").c_str());  // left by a killed earlier run
 
     Check(Near(Fov(90.0f), 90.0f), "getFov works before injection");
     Check(Near(Gamma(), 1.0f), "getGamma works before injection");
@@ -945,10 +998,12 @@ int main(int argc, char** argv) {
     HMODULE module = LoadLibraryA(dll);
     Check(module != nullptr, "DLL loads");
     if (!module) return 1;
-    if (g_useD3D12) {
-        WaitFor([] { return FileContains(DataDir() + L"\\BedrockQoL.log", "] Ready."); }, 20000);
-        g_renderPause = false;
-    }
+    // The menu sets up its Direct3D hooks on the DLL's worker thread shortly after loading; wait for it,
+    // so the key tests below do not race with it.
+    WaitFor([] { return FileContains(DataDir() + L"\\BedrockQoL.log", "Menu: Present hooked") ||
+                        FileContains(DataDir() + L"\\BedrockQoL.log", "Menu unavailable"); },
+            20000);
+    g_renderPause = false;
 
     Check(WaitFor([] { return IsHooked((void*)fake_getFov) && IsHooked((void*)fake_keyboardFeed) &&
                               IsHooked((void*)fake_mouseFeed) && IsHooked((void*)fake_getGamma); },
@@ -1119,6 +1174,7 @@ int main(int argc, char** argv) {
         Check(WaitFor([&] { return g_frames > frames + 5; }, 2000) && IsClear(Capture(), 400, 300),
               "the game keeps presenting clean frames after unload");
     }
+    if (rendering) SafeModeTests(dll);
     StopRenderer();
 
     std::printf("\n%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures, g_failures == 1 ? "" : "s");

@@ -49,6 +49,7 @@ add_library(BedrockQoL SHARED
     src/chat.cpp
     src/commands.cpp
     src/config.cpp
+    src/crashlog.cpp
     src/events.cpp
     src/game.cpp
     src/hooks.cpp
@@ -101,7 +102,9 @@ else()
     # MinGW: link libgcc/libstdc++/winpthread statically for the same reason.
     target_compile_options(BedrockQoL PRIVATE -Wall -Wextra)
     target_compile_options(BedrockQoLLauncher PRIVATE -Wall -Wextra)
-    target_link_options(BedrockQoL PRIVATE -static -static-libgcc -static-libstdc++ -s)
+    # The map file turns "CRASH: ... at BedrockQoL.dll+0x..." lines of the log into function names.
+    target_link_options(BedrockQoL PRIVATE -static -static-libgcc -static-libstdc++ -s
+                        -Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/BedrockQoL.map)
     target_link_options(BedrockQoLLauncher PRIVATE -static -static-libgcc -static-libstdc++ -s)
 endif()
 

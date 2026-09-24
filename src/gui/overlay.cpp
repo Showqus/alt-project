@@ -4,11 +4,18 @@
 #include <d3d12.h>
 #include <dxgi1_4.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <memory>
+#include <string>
 #include <vector>
 
+#include "../config.h"
+#include "../crashlog.h"
 #include "../log.h"
+#include "../notify.h"
+#include "../text.h"
 #include "MinHook.h"
 #include "automation.h"
 #include "imgui.h"
@@ -44,8 +51,16 @@ ResizeBuffers1Fn g_resizeBuffers1 = nullptr;
 ExecuteCommandListsFn g_executeCommandLists = nullptr;
 std::vector<void*> g_targets;
 
-std::atomic<ID3D12CommandQueue*> g_queue{nullptr};  // last direct queue the game submitted work to
+// Command queues seen in ExecuteCommandLists: the game's direct queues (one of them presents), other
+// types (so their description is read once), and the direct queue that submitted work last.
+constexpr int kMaxQueues = 16;
+std::atomic<ID3D12CommandQueue*> g_directQueues[kMaxQueues] = {};
+std::atomic<ID3D12CommandQueue*> g_otherQueues[kMaxQueues] = {};
+std::atomic<int> g_directCount{0};
+std::atomic<int> g_otherCount{0};
+std::atomic<ID3D12CommandQueue*> g_queue{nullptr};
 std::atomic<ID3D12CommandQueue*> g_ownQueue{nullptr};  // the throw-away queue of HookD3D12 (not the game's)
+bool g_installed = false;  // worker thread
 
 enum class Phase { Running, ShutdownRequested, Stopped };
 std::atomic<Phase> g_phase{Phase::Running};
@@ -56,6 +71,8 @@ SRWLOCK g_frameLock = SRWLOCK_INIT;  // one frame / resize / shutdown at a time
 std::unique_ptr<Renderer> g_renderer;
 IDXGISwapChain* g_failedSwapChain = nullptr;  // do not retry a swap chain that cannot be used
 bool g_imgui = false;
+bool g_firstFrameLogged = false;
+bool g_menuWasOpen = false;
 LARGE_INTEGER g_lastFrameTime{};
 LARGE_INTEGER g_frequency{};
 
@@ -68,6 +85,64 @@ SRWLOCK g_statusLock = SRWLOCK_INIT;
 std::string g_status = "меню ещё не нарисовано: игра не показала ни одного кадра";
 
 thread_local int t_presentDepth = 0;
+
+// --- Crash guard ---------------------------------------------------------------------------
+// control\menu_guard.txt exists while the menu does something for the first time in a session:
+// hooking, creating its renderer and drawing its first frames, opening. If the game dies meanwhile,
+// the next start finds the file and switches the menu off ([Menu] Enabled=0) instead of crashing
+// the game again; everything else keeps working.
+
+SRWLOCK g_guardLock = SRWLOCK_INIT;
+std::atomic<bool> g_guardArmed{false};
+int g_guardFrames = 0;
+ULONGLONG g_guardSince = 0;
+
+std::wstring GuardPath() { return config::Directory() + L"\\control\\menu_guard.txt"; }
+
+void ArmGuard(const char* phase) {
+    AcquireSRWLockExclusive(&g_guardLock);
+    if (!g_guardArmed) {
+        if (FILE* f = _wfopen(GuardPath().c_str(), L"wb")) {
+            fputs(phase, f);
+            fclose(f);
+        }
+        g_guardArmed = true;
+    }
+    g_guardFrames = 0;
+    g_guardSince = GetTickCount64();
+    ReleaseSRWLockExclusive(&g_guardLock);
+}
+
+void DisarmGuard() {
+    AcquireSRWLockExclusive(&g_guardLock);
+    if (g_guardArmed) DeleteFileW(GuardPath().c_str());
+    g_guardArmed = false;
+    ReleaseSRWLockExclusive(&g_guardLock);
+}
+
+// Render thread, every Present: a couple of seconds of drawn frames means it works; so do 10 seconds
+// of the game running with nothing to draw (then there is nothing that could crash).
+void GuardTick(bool drewFrame) {
+    if (!g_guardArmed.load(std::memory_order_relaxed)) return;
+    AcquireSRWLockExclusive(&g_guardLock);
+    if (drewFrame) ++g_guardFrames;
+    const ULONGLONG elapsed = GetTickCount64() - g_guardSince;
+    const bool done = (g_guardFrames >= 60 && elapsed >= 2000) || elapsed >= 10000;
+    ReleaseSRWLockExclusive(&g_guardLock);
+    if (done) DisarmGuard();
+}
+
+// Worker thread, at start: true if the previous session died inside a guarded phase.
+bool PreviousSessionCrashed(std::string& phase) {
+    FILE* f = _wfopen(GuardPath().c_str(), L"rb");
+    if (!f) return false;
+    char buffer[128] = {};
+    fread(buffer, 1, sizeof(buffer) - 1, f);
+    fclose(f);
+    phase = buffer;
+    DeleteFileW(GuardPath().c_str());
+    return true;
+}
 
 void SetStatus(const std::string& status) {
     AcquireSRWLockExclusive(&g_statusLock);
@@ -86,10 +161,20 @@ void DestroyAll() {
     g_renderer.reset();
 }
 
+std::vector<ID3D12CommandQueue*> DirectQueues() {
+    std::vector<ID3D12CommandQueue*> queues;
+    const int count = std::min(g_directCount.load(), kMaxQueues);
+    for (int i = 0; i < count; ++i) {
+        if (ID3D12CommandQueue* q = g_directQueues[i].load()) queues.push_back(q);
+    }
+    return queues;
+}
+
 bool CreateAll(IDXGISwapChain* swapChain) {
+    crashlog::Scope scope("creating the menu renderer");
     bool retry = false;
     std::string error;
-    std::unique_ptr<Renderer> renderer = CreateRenderer(swapChain, g_queue.load(), retry, error);
+    std::unique_ptr<Renderer> renderer = CreateRenderer(swapChain, DirectQueues(), g_queue.load(), retry, error);
     if (!renderer) {
         if (!retry) {
             g_failedSwapChain = swapChain;
@@ -99,6 +184,8 @@ bool CreateAll(IDXGISwapChain* swapChain) {
         return false;
     }
 
+    ArmGuard("creating the menu renderer");
+    logx::Info("Menu: creating the renderer (%s)", renderer->Details().c_str());
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     g_imgui = true;
@@ -114,13 +201,90 @@ bool CreateAll(IDXGISwapChain* swapChain) {
         g_renderer = std::move(renderer);
         DestroyAll();
         g_failedSwapChain = swapChain;
+        DisarmGuard();
         return false;
     }
     g_renderer = std::move(renderer);
     g_window = g_renderer->Window();
-    logx::Info("Menu ready: %s, %ux%u", g_renderer->Name(), g_renderer->Width(), g_renderer->Height());
+    g_firstFrameLogged = false;
+    logx::Info("Menu ready: %s", g_renderer->Details().c_str());
     SetStatus(std::string(g_renderer->Name()));
     g_rendererOk = true;
+    return true;
+}
+
+// One Present of the game, under g_frameLock. Returns true if the menu drew something.
+bool DrawFrame(IDXGISwapChain* swapChain) {
+    const ULONGLONG now = GetTickCount64();
+    if (!g_renderer || g_renderer->SwapChain() != swapChain) {
+        // Another swap chain while ours is still presenting (e.g. a second window): leave it alone.
+        if (g_renderer && now - g_lastPresent.load() < 2000) return false;
+        if (swapChain == g_failedSwapChain) return false;
+        if (g_renderer) {
+            logx::Info("Menu: the game switched to a new swap chain, recreating the menu");
+            DestroyAll();
+        }
+        if (!CreateAll(swapChain)) return false;
+    }
+    g_lastPresent = now;
+
+    Renderer& renderer = *g_renderer;
+    renderer.UpdateSize();
+    g_width = renderer.Width();
+    g_height = renderer.Height();
+
+    if (!menu::WantsFrame() || renderer.Width() == 0 || renderer.Height() == 0) {
+        g_menuWasOpen = false;
+        g_lastFrameTime.QuadPart = 0;
+        return false;
+    }
+
+    crashlog::Scope scope("drawing the menu");
+    HRESULT reason = S_OK;
+    if (renderer.DeviceLost(reason)) {
+        logx::Error("Menu: the %s device was removed (0x%08lX), the menu is stopped", renderer.Name(),
+                    static_cast<unsigned long>(reason));
+        char code[16];
+        snprintf(code, sizeof(code), "0x%08lX", static_cast<unsigned long>(reason));
+        SetStatus(std::string("меню остановлено: устройство Direct3D потеряно (") + code + ")");
+        DestroyAll();
+        g_failedSwapChain = swapChain;
+        DisarmGuard();
+        return false;
+    }
+    if (!renderer.SameDevice(swapChain)) {
+        // New device, new swap chain at the old address: start over on the next frame.
+        logx::Info("Menu: the game recreated its Direct3D device, recreating the menu");
+        DestroyAll();
+        return false;
+    }
+    if (MenuOpen() && !g_menuWasOpen) ArmGuard("opening the menu");
+    g_menuWasOpen = MenuOpen();
+
+    ImGuiIO& io = ImGui::GetIO();
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    if (g_frequency.QuadPart == 0) QueryPerformanceFrequency(&g_frequency);
+    const float dt = g_lastFrameTime.QuadPart ? static_cast<float>(t.QuadPart - g_lastFrameTime.QuadPart) /
+                                                    static_cast<float>(g_frequency.QuadPart)
+                                              : 1.0f / 60.0f;
+    g_lastFrameTime = t;
+    io.DeltaTime = dt > 0.0f ? (dt < 0.25f ? dt : 0.25f) : 1.0f / 60.0f;
+    io.DisplaySize = ImVec2(static_cast<float>(renderer.Width()), static_cast<float>(renderer.Height()));
+
+    menu::BeginFrame(io);
+    automation::BeginFrame();
+    renderer.NewFrame();
+    ImGui::NewFrame();
+    menu::Draw();
+    ImGui::Render();
+    renderer.Render(ImGui::GetDrawData());
+    automation::EndFrame();
+    FlushWrites();
+    if (!g_firstFrameLogged) {
+        g_firstFrameLogged = true;
+        logx::Info("Menu: first frame drawn");
+    }
     return true;
 }
 
@@ -133,60 +297,8 @@ void Frame(IDXGISwapChain* swapChain) {
         DestroyAll();
         g_phase = Phase::Stopped;
         SetEvent(g_stoppedEvent);
-        ReleaseSRWLockExclusive(&g_frameLock);
-        return;
-    }
-
-    const ULONGLONG now = GetTickCount64();
-    if (!g_renderer || g_renderer->SwapChain() != swapChain) {
-        // Another swap chain while ours is still presenting (e.g. a second window): leave it alone.
-        if (g_renderer && now - g_lastPresent.load() < 2000) {
-            ReleaseSRWLockExclusive(&g_frameLock);
-            return;
-        }
-        if (swapChain == g_failedSwapChain) {
-            ReleaseSRWLockExclusive(&g_frameLock);
-            return;
-        }
-        if (g_renderer) {
-            logx::Info("Menu: the game switched to a new swap chain, recreating the menu");
-            DestroyAll();
-        }
-        if (!CreateAll(swapChain)) {
-            ReleaseSRWLockExclusive(&g_frameLock);
-            return;
-        }
-    }
-    g_lastPresent = now;
-
-    Renderer& renderer = *g_renderer;
-    renderer.UpdateSize();
-    g_width = renderer.Width();
-    g_height = renderer.Height();
-
-    if (menu::WantsFrame() && renderer.Width() > 0 && renderer.Height() > 0) {
-        ImGuiIO& io = ImGui::GetIO();
-        LARGE_INTEGER t;
-        QueryPerformanceCounter(&t);
-        if (g_frequency.QuadPart == 0) QueryPerformanceFrequency(&g_frequency);
-        float dt = g_lastFrameTime.QuadPart
-                       ? static_cast<float>(t.QuadPart - g_lastFrameTime.QuadPart) / static_cast<float>(g_frequency.QuadPart)
-                       : 1.0f / 60.0f;
-        g_lastFrameTime = t;
-        io.DeltaTime = dt > 0.0f ? (dt < 0.25f ? dt : 0.25f) : 1.0f / 60.0f;
-        io.DisplaySize = ImVec2(static_cast<float>(renderer.Width()), static_cast<float>(renderer.Height()));
-
-        menu::BeginFrame(io);
-        automation::BeginFrame();
-        renderer.NewFrame();
-        ImGui::NewFrame();
-        menu::Draw();
-        ImGui::Render();
-        renderer.Render(ImGui::GetDrawData());
-        automation::EndFrame();
-        FlushWrites();
-    } else {
-        g_lastFrameTime.QuadPart = 0;
+    } else if (g_config.menuEnabled.load(std::memory_order_relaxed)) {
+        GuardTick(DrawFrame(swapChain));
     }
     ReleaseSRWLockExclusive(&g_frameLock);
 }
@@ -239,11 +351,33 @@ HRESULT STDMETHODCALLTYPE HookResizeBuffers1(IDXGISwapChain3* swapChain, UINT co
     return g_resizeBuffers1(swapChain, count, width, height, format, flags, nodeMasks, queues);
 }
 
+bool InTable(std::atomic<ID3D12CommandQueue*>* table, const std::atomic<int>& count, ID3D12CommandQueue* queue) {
+    const int n = std::min(count.load(std::memory_order_relaxed), kMaxQueues);
+    for (int i = 0; i < n; ++i) {
+        if (table[i].load(std::memory_order_relaxed) == queue) return true;
+    }
+    return false;
+}
+
+void AddToTable(std::atomic<ID3D12CommandQueue*>* table, std::atomic<int>& count, ID3D12CommandQueue* queue) {
+    const int slot = count.fetch_add(1);
+    if (slot < kMaxQueues) table[slot].store(queue);
+}
+
+// Runs for every command list the game submits (often, from several threads): keep it cheap.
 void STDMETHODCALLTYPE HookExecuteCommandLists(ID3D12CommandQueue* queue, UINT count,
                                                ID3D12CommandList* const* lists) {
-    if (g_queue.load(std::memory_order_relaxed) != queue && queue != g_ownQueue.load(std::memory_order_relaxed) &&
-        queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
-        g_queue.store(queue);
+    if (queue != g_queue.load(std::memory_order_relaxed) && queue != g_ownQueue.load(std::memory_order_relaxed)) {
+        if (InTable(g_directQueues, g_directCount, queue)) {
+            g_queue.store(queue);
+        } else if (!InTable(g_otherQueues, g_otherCount, queue)) {
+            if (queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+                AddToTable(g_directQueues, g_directCount, queue);
+                g_queue.store(queue);
+            } else {
+                AddToTable(g_otherQueues, g_otherCount, queue);
+            }
+        }
     }
     g_executeCommandLists(queue, count, lists);
 }
@@ -402,7 +536,6 @@ bool HookD3D12(HWND hwnd, int slot) {
 }  // namespace
 
 bool Install() {
-    g_stoppedEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     DummyWindow window;
     if (!window.hwnd) {
         logx::Error("Menu unavailable: could not create a window for the Direct3D test device");
@@ -426,8 +559,44 @@ bool Install() {
     return true;
 }
 
+bool Start() {
+    if (g_installed) return true;
+    if (!g_config.menuEnabled) {
+        logx::Info("Menu: switched off in config.ini ([Menu] Enabled=0)");
+        SetStatus("меню выключено в config.ini ([Menu] Enabled=0)");
+        return false;
+    }
+    std::string phase;
+    if (PreviousSessionCrashed(phase)) {
+        logx::Error("Menu: the previous game session ended while %s - the menu is switched off ([Menu] Enabled=0). "
+                    "The log of that session is BedrockQoL.prev.log",
+                    phase.c_str());
+        config::Set("Menu", "Enabled", "0");
+        SetStatus("меню выключено: в прошлый раз игра закрылась, когда оно запускалось");
+        notify::Send("Меню BedrockQoL выключено: в прошлый раз игра закрылась с ошибкой, когда меню запускалось. "
+                     "Остальные функции работают. Включить меню: " + config::Prefix() +
+                     "set Menu.Enabled 1. Пришлите разработчику файл BedrockQoL.prev.log из папки настроек.");
+        return false;
+    }
+
+    if (!g_stoppedEvent) g_stoppedEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    // Armed until the game has presented frames through the new hooks for a while (GuardTick).
+    ArmGuard("setting up the menu hooks");
+    bool ok;
+    {
+        crashlog::Scope scope("setting up the menu hooks");
+        ok = Install();
+    }
+    if (!ok) DisarmGuard();
+    g_installed = ok;
+    return ok;
+}
+
+void OnProcessExit() { DisarmGuard(); }
+
 void Shutdown() {
     SetMenuOpen(false);
+    DisarmGuard();  // a clean unload is not a crash
     if (g_phase.load() == Phase::Stopped || !g_stoppedEvent) return;
     g_phase = Phase::ShutdownRequested;
 
@@ -444,10 +613,14 @@ void Shutdown() {
     }
     CloseHandle(g_stoppedEvent);
     g_stoppedEvent = nullptr;
+    DisarmGuard();
     logx::Info("Menu shut down");
 }
 
-bool Ready() { return g_rendererOk.load() && GetTickCount64() - g_lastPresent.load() < 1000; }
+bool Ready() {
+    return g_config.menuEnabled.load(std::memory_order_relaxed) && g_rendererOk.load() &&
+           GetTickCount64() - g_lastPresent.load() < 1000;
+}
 
 std::string Status() {
     AcquireSRWLockShared(&g_statusLock);

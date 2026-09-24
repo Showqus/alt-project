@@ -10,8 +10,13 @@ namespace gui::overlay {
 
 // Worker thread, after MH_Initialize: finds IDXGISwapChain::Present / ResizeBuffers (and
 // ID3D12CommandQueue::ExecuteCommandLists when the game uses Direct3D 12) through throw-away
-// devices and hooks them. Returns false if the menu will not be available.
-bool Install();
+// devices and hooks them. Returns false if the menu will not be available: switched off
+// ([Menu] Enabled=0), or the previous game session died while the menu was starting (then it
+// switches itself off and tells the player). Does nothing once it succeeded.
+bool Start();
+
+// The game is exiting normally (DllMain, DLL_PROCESS_DETACH): not a crash.
+void OnProcessExit();
 
 // Worker thread, before the hooks are removed: destroys the menu on the render thread (or here, if
 // the game stopped presenting) so no GPU object or ImGui state outlives the DLL.

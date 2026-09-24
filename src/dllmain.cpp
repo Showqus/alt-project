@@ -8,6 +8,7 @@
 
 #include "commands.h"
 #include "config.h"
+#include "crashlog.h"
 #include "events.h"
 #include "features/autosprint.h"
 #include "features/zoom.h"
@@ -79,6 +80,17 @@ void RunControlCommands() {
     }
 }
 
+// Seconds since the game process started.
+double ProcessAgeSeconds() {
+    FILETIME created, exited, kernel, user, now;
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 1e9;
+    GetSystemTimeAsFileTime(&now);
+    const auto ticks = [](const FILETIME& t) {
+        return (static_cast<unsigned long long>(t.dwHighDateTime) << 32) | t.dwLowDateTime;
+    };
+    return static_cast<double>(ticks(now) - ticks(created)) / 1e7;
+}
+
 // Edge detection on top of GetAsyncKeyState for the polling fallback.
 class KeyPoller {
 public:
@@ -103,6 +115,8 @@ void WorkerLoop(HANDLE unloadEvent) {
     unsigned transitionsWithoutHook = 0;
     ULONGLONG lastControlCheck = 0;
     std::string menuStatus = "unavailable";
+    bool menuEnabled = cfg.menuEnabled;
+    bool menuStarted = false;  // gui::overlay::Start was called (it runs once the game had time to set up)
 
     while (WaitForSingleObject(unloadEvent, 10) == WAIT_TIMEOUT) {
         events::Event event;
@@ -126,6 +140,14 @@ void WorkerLoop(HANDLE unloadEvent) {
         if (now - lastControlCheck >= 250) {
             lastControlCheck = now;
             RunControlCommands();
+            // The menu hooks Direct3D once the game has had time to set up its own renderer, and again
+            // when [Menu] Enabled is switched on while the game runs (e.g. after the crash guard).
+            if (cfg.menuEnabled && !menuEnabled) menuStarted = false;
+            menuEnabled = cfg.menuEnabled;
+            if (!menuStarted && ProcessAgeSeconds() >= cfg.menuStartDelay) {
+                menuStarted = true;
+                gui::overlay::Start();
+            }
             const std::string menu = gui::overlay::Ready() ? gui::overlay::Status() : "unavailable";
             if (menu != menuStatus) {
                 menuStatus = menu;
@@ -181,7 +203,11 @@ DWORD WINAPI MainThread(LPVOID param) {
     HMODULE module = static_cast<HMODULE>(param);
 
     const std::wstring dir = game::DataDirectory();
+    // Keep the log of the previous session: if the game crashed, that is the one that tells why.
+    MoveFileExW((dir + L"\\BedrockQoL.log").c_str(), (dir + L"\\BedrockQoL.prev.log").c_str(),
+                MOVEFILE_REPLACE_EXISTING);
     logx::Init(dir + L"\\BedrockQoL.log");
+    crashlog::Install(module);
     logx::Info("BedrockQoL %s loaded, data folder: %s", BEDROCKQOL_VERSION, text::Narrow(dir).c_str());
     LogGameVersion();
 
@@ -206,6 +232,7 @@ DWORD WINAPI MainThread(LPVOID param) {
     hooks::Uninstall();
     DeleteFileW(ControlPath(L"status.txt").c_str());
     logx::Info("Unloaded");
+    crashlog::Uninstall();
     logx::Shutdown();
 
     FreeLibraryAndExitThread(module, 0);
@@ -214,11 +241,13 @@ DWORD WINAPI MainThread(LPVOID param) {
 
 }  // namespace
 
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(module);
         HANDLE thread = CreateThread(nullptr, 0, MainThread, module, 0, nullptr);
         if (thread) CloseHandle(thread);
+    } else if (reason == DLL_PROCESS_DETACH && reserved) {
+        gui::overlay::OnProcessExit();  // the game closes normally
     }
     return TRUE;
 }

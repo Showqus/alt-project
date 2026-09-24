@@ -486,6 +486,10 @@ void ThemeCmd(const std::vector<std::string>& args) {
 }
 
 void MenuCmd() {
+    if (!g_config.menuEnabled) {
+        notify::Send("Меню выключено ([Menu] Enabled=0). Включить: " + config::Prefix() + "set Menu.Enabled 1");
+        return;
+    }
     if (!gui::overlay::Ready()) {
         notify::Send("Меню недоступно: " + gui::overlay::Status());
         return;
