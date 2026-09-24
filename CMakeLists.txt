@@ -23,39 +23,55 @@ add_library(minhook STATIC
 )
 target_include_directories(minhook PUBLIC third_party/minhook/include)
 
+set(BEDROCKQOL_VERSION "dev" CACHE STRING "Version string compiled into the DLL (CI sets build number + commit)")
+
 # The mod itself
 add_library(BedrockQoL SHARED
     src/dllmain.cpp
+    src/chat.cpp
+    src/commands.cpp
     src/config.cpp
+    src/events.cpp
     src/game.cpp
     src/hooks.cpp
     src/keys.cpp
     src/log.cpp
+    src/notify.cpp
     src/scanner.cpp
+    src/text.cpp
     src/features/autosprint.cpp
+    src/features/fullbright.cpp
+    src/features/texthotkey.cpp
     src/features/zoom.cpp
 )
 target_link_libraries(BedrockQoL PRIVATE minhook user32 shell32 ole32)
-target_compile_definitions(BedrockQoL PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+target_compile_definitions(BedrockQoL PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS
+                           BEDROCKQOL_VERSION="${BEDROCKQOL_VERSION}")
 set_target_properties(BedrockQoL PROPERTIES PREFIX "" OUTPUT_NAME "BedrockQoL")
 
-# Injector
-add_executable(BedrockQoLInjector injector/injector.cpp)
-target_link_libraries(BedrockQoLInjector PRIVATE advapi32 shell32)
-target_compile_definitions(BedrockQoLInjector PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+# Launcher: headless background app (tray icon optional) with auto-inject and auto-update.
+add_executable(BedrockQoLLauncher WIN32
+    launcher/main.cpp
+    launcher/common.cpp
+    launcher/inject.cpp
+    launcher/service.cpp
+    launcher/update.cpp
+)
+target_link_libraries(BedrockQoLLauncher PRIVATE advapi32 shell32 ole32 user32 comdlg32 winhttp bcrypt)
+target_compile_definitions(BedrockQoLLauncher PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
 
 if(MSVC)
     # Static CRT so the DLL has no extra runtime dependencies inside the game.
-    set_property(TARGET minhook BedrockQoL BedrockQoLInjector PROPERTY
+    set_property(TARGET minhook BedrockQoL BedrockQoLLauncher PROPERTY
                  MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     target_compile_options(BedrockQoL PRIVATE /W4 /utf-8)
-    target_compile_options(BedrockQoLInjector PRIVATE /W4 /utf-8)
+    target_compile_options(BedrockQoLLauncher PRIVATE /W4 /utf-8)
 else()
     # MinGW: link libgcc/libstdc++/winpthread statically for the same reason.
     target_compile_options(BedrockQoL PRIVATE -Wall -Wextra)
-    target_compile_options(BedrockQoLInjector PRIVATE -Wall -Wextra)
+    target_compile_options(BedrockQoLLauncher PRIVATE -Wall -Wextra)
     target_link_options(BedrockQoL PRIVATE -static -static-libgcc -static-libstdc++ -s)
-    target_link_options(BedrockQoLInjector PRIVATE -static -static-libgcc -static-libstdc++ -s)
+    target_link_options(BedrockQoLLauncher PRIVATE -static -static-libgcc -static-libstdc++ -s)
 endif()
 
 # Smoke test: a fake "game" whose code matches the signatures (MinGW only, uses GAS assembly).

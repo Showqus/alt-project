@@ -18,6 +18,4 @@ void PollFallback(bool focused, bool inWorld);
 // Fallback mode: releases a sprint key that was pressed with SendInput.
 void ReleaseFallback();
 
-void Toggle();
-
 }  // namespace autosprint

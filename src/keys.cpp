@@ -27,7 +27,9 @@ const NamedKey kNamedKeys[] = {
     {"NUMPAD7", VK_NUMPAD7}, {"NUMPAD8", VK_NUMPAD8}, {"NUMPAD9", VK_NUMPAD9}, {"GRAVE", VK_OEM_3},
     {"MINUS", VK_OEM_MINUS}, {"EQUALS", VK_OEM_PLUS}, {"LBRACKET", VK_OEM_4}, {"RBRACKET", VK_OEM_6},
     {"SEMICOLON", VK_OEM_1}, {"APOSTROPHE", VK_OEM_7}, {"COMMA", VK_OEM_COMMA}, {"PERIOD", VK_OEM_PERIOD},
-    {"SLASH", VK_OEM_2},  {"BACKSLASH", VK_OEM_5},
+    {"SLASH", VK_OEM_2},  {"BACKSLASH", VK_OEM_5}, {"LSHIFT", VK_LSHIFT}, {"RSHIFT", VK_RSHIFT},
+    {"LCTRL", VK_LCONTROL}, {"RCTRL", VK_RCONTROL}, {"LALT", VK_LMENU}, {"RALT", VK_RMENU},
+    {"MOUSE4", VK_XBUTTON1}, {"MOUSE5", VK_XBUTTON2}, {"MMB", VK_MBUTTON},
 };
 
 std::string Normalize(const std::string& in) {

@@ -1,45 +1,90 @@
 #pragma once
 
+#include <atomic>
 #include <string>
+#include <vector>
 
+struct TextHotkeyEntry {
+    std::string id;    // INI key in [TextHotkeys] ("1", "2", ...)
+    int key = 0;       // virtual-key code
+    std::string text;  // UTF-8 text to send; if it starts with the command prefix it runs as a command
+};
+
+// Scalars are atomic because they are read from game threads (input/render hooks) while the
+// worker thread may reload or change them.
 struct Config {
     // [General]
-    int unloadKey = 0x23;  // END
-    bool requireHiddenCursor = true;
+    std::atomic<int> unloadKey{0x23};  // END
+    std::atomic<bool> requireHiddenCursor{true};
+
+    // [Chat]
+    std::atomic<bool> chatCommands{true};
+    std::atomic<int> chatOpenKey{'T'};
+    std::atomic<int> chatCommandKey{0xBF};  // '/' key (VK_OEM_2)
 
     // [AutoSprint]
-    bool sprintEnabled = true;
-    int sprintToggleKey = 0x77;  // F8
-    int forwardKey = 'W';
-    int sprintKey = 0x11;  // CTRL
-    bool sprintFallbackSendInput = true;
+    std::atomic<bool> sprintEnabled{true};
+    std::atomic<int> sprintToggleKey{0x77};  // F8
+    std::atomic<int> forwardKey{'W'};
+    std::atomic<int> sprintKey{0x11};  // CTRL
+    std::atomic<bool> sprintFallbackSendInput{true};
 
     // [Zoom]
-    bool zoomEnabled = true;
-    int zoomKey = 'C';
-    bool zoomToggle = false;
-    float zoomFactor = 4.0f;
-    float zoomMinFactor = 1.5f;
-    float zoomMaxFactor = 50.0f;
-    bool zoomScrollAdjust = true;
-    float zoomScrollStep = 1.25f;
-    bool zoomRememberScroll = false;
-    bool zoomSmooth = true;
-    float zoomSmoothSpeed = 12.0f;
-    bool zoomHand = false;
+    std::atomic<bool> zoomEnabled{true};
+    std::atomic<int> zoomKey{'C'};
+    std::atomic<bool> zoomToggle{false};
+    std::atomic<float> zoomFactor{4.0f};
+    std::atomic<float> zoomMinFactor{1.5f};
+    std::atomic<float> zoomMaxFactor{50.0f};
+    std::atomic<bool> zoomScrollAdjust{true};
+    std::atomic<float> zoomScrollStep{1.25f};
+    std::atomic<bool> zoomRememberScroll{false};
+    std::atomic<bool> zoomSmooth{true};
+    std::atomic<float> zoomSmoothSpeed{12.0f};
+    std::atomic<bool> zoomHand{false};
 
-    // [Signatures] - empty means "use the built-in ones".
+    // [Fullbright]
+    std::atomic<bool> fullbrightEnabled{false};
+    std::atomic<int> fullbrightToggleKey{0};
+    std::atomic<float> fullbrightGamma{25.0f};
+
+    // [TextHotkey] + [TextHotkeys]
+    std::atomic<bool> textHotkeyEnabled{true};
+    std::atomic<int> textHotkeyToggleKey{0};
+    std::atomic<float> textHotkeyCooldown{1.0f};
+    std::vector<TextHotkeyEntry> textHotkeys;  // worker thread only
+
+    // [Signatures] - empty means "use the built-in ones". Read once at startup.
     std::string sigGetFov;
     std::string sigKeyboardFeed;
     std::string sigMouseFeed;
+    std::string sigGetGamma;
 };
 
-// Global configuration, loaded once at startup.
+// Global configuration.
 extern Config g_config;
 
 namespace config {
 
-// Loads the INI file; writes a commented default file first if it does not exist.
-void Load(const std::wstring& path);
+// Remembers the data directory, writes a commented default config.ini if missing, then loads it.
+void Init(const std::wstring& dataDirectory);
+
+// Re-reads config.ini (after it was edited, or a profile was loaded).
+void Reload();
+
+// Writes one value into config.ini and reloads. Returns false if the file could not be written.
+bool Set(const std::string& section, const std::string& key, const std::string& value);
+
+// Removes one key from config.ini and reloads.
+bool Remove(const std::string& section, const std::string& key);
+
+// Raw value from config.ini ("" if missing).
+std::string Get(const std::string& section, const std::string& key);
+
+// Chat command prefix (e.g. "." or ";"). Thread-safe copy.
+std::string Prefix();
+
+const std::wstring& Directory();  // ...\RoamingState\BedrockQoL
+const std::wstring& Path();       // ...\config.ini
 
 }  // namespace config

@@ -7,6 +7,7 @@
 
 #include "keys.h"
 #include "log.h"
+#include "text.h"
 
 Config g_config;
 
@@ -14,11 +15,12 @@ namespace config {
 namespace {
 
 const char kDefaultIni[] =
-    "; BedrockQoL - AutoSprint + Zoom for Minecraft Bedrock (Windows) 1.21.5x\n"
+    "; BedrockQoL - AutoSprint, Zoom, Fullbright, TextHotkey and chat commands\n"
+    "; for Minecraft Bedrock (Windows) 1.21.5x.\n"
     ";\n"
     "; Key names: A-Z, 0-9, F1-F24, CTRL, SHIFT, ALT, SPACE, TAB, CAPSLOCK, END, HOME,\n"
-    "; INSERT, DELETE, PAGEUP, PAGEDOWN, NUMPAD0-9, NONE, or a virtual-key code (e.g. 0x43).\n"
-    "; Restart the game (or unload + inject again) after editing this file.\n"
+    "; INSERT, DELETE, PAGEUP, PAGEDOWN, NUMPAD0-9, SLASH, GRAVE, NONE, or a virtual-key code (0x43).\n"
+    "; Most settings can also be changed in game through chat commands (type .help in chat).\n"
     "\n"
     "[General]\n"
     "; Key that unloads the DLL from the game.\n"
@@ -26,6 +28,15 @@ const char kDefaultIni[] =
     "; 1 = only react while the mouse cursor is hidden (i.e. you are in the world,\n"
     ";     not in chat/inventory/menus). Set to 0 if features never activate.\n"
     "RequireHiddenCursor=1\n"
+    "\n"
+    "[Chat]\n"
+    "; Chat commands such as .bind / .toggle / .config. The message is not sent to the server.\n"
+    "Commands=1\n"
+    "; Prefix for chat commands. Change it in game with: .prefix ;\n"
+    "Prefix=.\n"
+    "; Must match the in-game \"Open chat\" / \"Open command\" keys.\n"
+    "OpenKey=T\n"
+    "CommandKey=SLASH\n"
     "\n"
     "[AutoSprint]\n"
     "Enabled=1\n"
@@ -56,37 +67,53 @@ const char kDefaultIni[] =
     "; 1 = also zoom the first-person hand.\n"
     "ZoomHand=0\n"
     "\n"
+    "[Fullbright]\n"
+    "Enabled=0\n"
+    "ToggleKey=NONE\n"
+    "; Brightness used while Fullbright is on (the in-game slider maxes out at 1.0).\n"
+    "Gamma=25\n"
+    "\n"
+    "[TextHotkey]\n"
+    "Enabled=1\n"
+    "ToggleKey=NONE\n"
+    "; Minimum seconds between two messages (servers kick for spam).\n"
+    "Cooldown=1.0\n"
+    "\n"
+    "[TextHotkeys]\n"
+    "; <number>=<KEY>|<text>. Text starting with the chat prefix runs as a command.\n"
+    "; Add them in game with: .th add F6 gg\n"
+    "\n"
     "[Signatures]\n"
     "; Leave empty to use the built-in signatures for 1.21.5x.\n"
     "; You can paste updated IDA-style patterns here (e.g. \"48 8B ? ? 89\").\n"
     "; Patterns starting with E8/E9 are treated as call sites and resolved to the callee.\n"
     "GetFov=\n"
     "KeyboardFeed=\n"
-    "MouseFeed=\n";
+    "MouseFeed=\n"
+    "GetGamma=\n";
 
+std::wstring g_dir;
 std::wstring g_path;
 
-std::string ReadString(const char* section, const char* key, const std::string& def) {
-    wchar_t wsection[64];
-    wchar_t wkey[64];
-    MultiByteToWideChar(CP_UTF8, 0, section, -1, wsection, 64);
-    MultiByteToWideChar(CP_UTF8, 0, key, -1, wkey, 64);
+SRWLOCK g_prefixLock = SRWLOCK_INIT;
+std::string g_prefix = ".";
 
-    wchar_t buffer[1024];
-    const DWORD len = GetPrivateProfileStringW(wsection, wkey, L"\x01", buffer, 1024, g_path.c_str());
+std::string ReadRaw(const std::string& section, const std::string& key, const std::string& def) {
+    const std::wstring wsection = text::Widen(section);
+    const std::wstring wkey = text::Widen(key);
+    wchar_t buffer[2048];
+    const DWORD len =
+        GetPrivateProfileStringW(wsection.c_str(), wkey.c_str(), L"\x01", buffer, 2048, g_path.c_str());
     if (len == 1 && buffer[0] == L'\x01') return def;
+    return text::Narrow(buffer);
+}
 
-    char out[1024];
-    WideCharToMultiByte(CP_UTF8, 0, buffer, -1, out, sizeof(out), nullptr, nullptr);
-
+std::string ReadString(const char* section, const char* key, const std::string& def) {
+    std::string value = ReadRaw(section, key, def);
     // Strip inline comments and surrounding whitespace / quotes.
-    std::string value = out;
-    const size_t comment = value.find(';');
+    const size_t comment = value.find(" ;");
     if (comment != std::string::npos) value.erase(comment);
-    while (!value.empty() && (value.back() == ' ' || value.back() == '\t' || value.back() == '"')) value.pop_back();
-    size_t start = 0;
-    while (start < value.size() && (value[start] == ' ' || value[start] == '\t' || value[start] == '"')) ++start;
-    return value.substr(start);
+    return text::Trim(value, " \t\"");
 }
 
 bool ReadBool(const char* section, const char* key, bool def) {
@@ -117,28 +144,107 @@ int ReadKey(const char* section, const char* key, int def) {
     return vk;
 }
 
-void WriteDefaultFile(const std::wstring& path) {
-    FILE* f = _wfopen(path.c_str(), L"wb");
+std::vector<TextHotkeyEntry> ReadTextHotkeys() {
+    std::vector<TextHotkeyEntry> entries;
+    std::vector<wchar_t> buffer(32768);
+    const DWORD len = GetPrivateProfileSectionW(L"TextHotkeys", buffer.data(), static_cast<DWORD>(buffer.size()),
+                                                g_path.c_str());
+    for (const wchar_t* p = buffer.data(); p < buffer.data() + len && *p; p += wcslen(p) + 1) {
+        const std::string line = text::Narrow(p);
+        if (line.empty() || line[0] == ';') continue;
+        const size_t eq = line.find('=');
+        const size_t bar = line.find('|', eq == std::string::npos ? 0 : eq);
+        if (eq == std::string::npos || bar == std::string::npos) continue;
+
+        TextHotkeyEntry entry;
+        entry.id = text::Trim(line.substr(0, eq), " \t");
+        entry.key = keys::Parse(line.substr(eq + 1, bar - eq - 1));
+        entry.text = line.substr(bar + 1);
+        if (entry.key <= 0 || entry.text.empty()) {
+            logx::Warn("Config [TextHotkeys] %s: bad entry '%s'", entry.id.c_str(), line.c_str());
+            continue;
+        }
+        entries.push_back(entry);
+    }
+    return entries;
+}
+
+// UTF-16LE with BOM: the Windows profile APIs then read and write any Unicode text (Cyrillic
+// TextHotkeys, emoji) instead of converting it to the ANSI code page.
+void WriteDefaultFile() {
+    FILE* f = _wfopen(g_path.c_str(), L"wb");
     if (!f) {
         logx::Warn("Could not create default config file, using built-in defaults");
         return;
     }
-    fwrite(kDefaultIni, 1, sizeof(kDefaultIni) - 1, f);
+    const std::wstring content = L"\xFEFF" + text::Widen(kDefaultIni);
+    fwrite(content.data(), sizeof(wchar_t), content.size(), f);
     fclose(f);
     logx::Info("Created default config file");
 }
 
+// Converts an ANSI / UTF-8 config file (older version, imported profile, edited in another
+// editor) to UTF-16LE so Unicode values survive WritePrivateProfileStringW.
+void EnsureUtf16(const std::wstring& path) {
+    FILE* f = _wfopen(path.c_str(), L"rb");
+    if (!f) return;
+    std::string bytes;
+    char buffer[4096];
+    size_t n;
+    while ((n = fread(buffer, 1, sizeof(buffer), f)) > 0) bytes.append(buffer, n);
+    fclose(f);
+    if (bytes.size() >= 2 && static_cast<unsigned char>(bytes[0]) == 0xFF && static_cast<unsigned char>(bytes[1]) == 0xFE) {
+        return;
+    }
+    if (bytes.size() >= 3 && bytes.compare(0, 3, "\xEF\xBB\xBF") == 0) bytes.erase(0, 3);
+
+    UINT codePage = CP_UTF8;
+    int len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(), static_cast<int>(bytes.size()), nullptr, 0);
+    if (len == 0 && !bytes.empty()) {
+        codePage = CP_ACP;
+        len = MultiByteToWideChar(CP_ACP, 0, bytes.data(), static_cast<int>(bytes.size()), nullptr, 0);
+    }
+    std::wstring wide(static_cast<size_t>(len), L'\0');
+    if (len > 0) MultiByteToWideChar(codePage, 0, bytes.data(), static_cast<int>(bytes.size()), &wide[0], len);
+    wide.insert(wide.begin(), L'\xFEFF');
+
+    if (FILE* out = _wfopen(path.c_str(), L"wb")) {
+        fwrite(wide.data(), sizeof(wchar_t), wide.size(), out);
+        fclose(out);
+        logx::Info("Converted %s to UTF-16", text::Narrow(path).c_str());
+    }
+}
+
+std::string SanitizePrefix(std::string prefix) {
+    prefix = text::Trim(prefix, " \t");
+    if (prefix.empty() || prefix.size() > 8) return ".";
+    return prefix;
+}
+
 }  // namespace
 
-void Load(const std::wstring& path) {
-    g_path = path;
-    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) WriteDefaultFile(path);
+void Init(const std::wstring& dataDirectory) {
+    g_dir = dataDirectory;
+    g_path = dataDirectory + L"\\config.ini";
+    if (GetFileAttributesW(g_path.c_str()) == INVALID_FILE_ATTRIBUTES) WriteDefaultFile();
+    Reload();
+}
 
+void Reload() {
+    EnsureUtf16(g_path);
     Config& c = g_config;
     const Config d;  // defaults
 
     c.unloadKey = ReadKey("General", "UnloadKey", d.unloadKey);
     c.requireHiddenCursor = ReadBool("General", "RequireHiddenCursor", d.requireHiddenCursor);
+
+    c.chatCommands = ReadBool("Chat", "Commands", d.chatCommands);
+    c.chatOpenKey = ReadKey("Chat", "OpenKey", d.chatOpenKey);
+    c.chatCommandKey = ReadKey("Chat", "CommandKey", d.chatCommandKey);
+    const std::string prefix = SanitizePrefix(ReadString("Chat", "Prefix", "."));
+    AcquireSRWLockExclusive(&g_prefixLock);
+    g_prefix = prefix;
+    ReleaseSRWLockExclusive(&g_prefixLock);
 
     c.sprintEnabled = ReadBool("AutoSprint", "Enabled", d.sprintEnabled);
     c.sprintToggleKey = ReadKey("AutoSprint", "ToggleKey", d.sprintToggleKey);
@@ -149,32 +255,78 @@ void Load(const std::wstring& path) {
     c.zoomEnabled = ReadBool("Zoom", "Enabled", d.zoomEnabled);
     c.zoomKey = ReadKey("Zoom", "Key", d.zoomKey);
     c.zoomToggle = ReadBool("Zoom", "Toggle", d.zoomToggle);
-    c.zoomFactor = ReadFloat("Zoom", "Factor", d.zoomFactor);
-    c.zoomMinFactor = ReadFloat("Zoom", "MinFactor", d.zoomMinFactor);
-    c.zoomMaxFactor = ReadFloat("Zoom", "MaxFactor", d.zoomMaxFactor);
+    float factor = ReadFloat("Zoom", "Factor", d.zoomFactor);
+    float minFactor = ReadFloat("Zoom", "MinFactor", d.zoomMinFactor);
+    float maxFactor = ReadFloat("Zoom", "MaxFactor", d.zoomMaxFactor);
     c.zoomScrollAdjust = ReadBool("Zoom", "ScrollAdjust", d.zoomScrollAdjust);
-    c.zoomScrollStep = ReadFloat("Zoom", "ScrollStep", d.zoomScrollStep);
+    float scrollStep = ReadFloat("Zoom", "ScrollStep", d.zoomScrollStep);
     c.zoomRememberScroll = ReadBool("Zoom", "RememberScroll", d.zoomRememberScroll);
-    c.zoomSmooth = ReadBool("Zoom", "Smooth", d.zoomSmooth);
-    c.zoomSmoothSpeed = ReadFloat("Zoom", "SmoothSpeed", d.zoomSmoothSpeed);
+    bool smooth = ReadBool("Zoom", "Smooth", d.zoomSmooth);
+    const float smoothSpeed = ReadFloat("Zoom", "SmoothSpeed", d.zoomSmoothSpeed);
     c.zoomHand = ReadBool("Zoom", "ZoomHand", d.zoomHand);
+
+    // Keep the numbers sane so a typo cannot produce a 0 or negative FOV.
+    if (minFactor < 1.0f) minFactor = 1.0f;
+    if (maxFactor < minFactor) maxFactor = minFactor;
+    if (factor < minFactor) factor = minFactor;
+    if (factor > maxFactor) factor = maxFactor;
+    if (scrollStep <= 1.0f) scrollStep = 1.25f;
+    if (smoothSpeed <= 0.0f) smooth = false;
+    c.zoomFactor = factor;
+    c.zoomMinFactor = minFactor;
+    c.zoomMaxFactor = maxFactor;
+    c.zoomScrollStep = scrollStep;
+    c.zoomSmooth = smooth;
+    c.zoomSmoothSpeed = smoothSpeed;
+
+    c.fullbrightEnabled = ReadBool("Fullbright", "Enabled", d.fullbrightEnabled);
+    c.fullbrightToggleKey = ReadKey("Fullbright", "ToggleKey", d.fullbrightToggleKey);
+    c.fullbrightGamma = ReadFloat("Fullbright", "Gamma", d.fullbrightGamma);
+
+    c.textHotkeyEnabled = ReadBool("TextHotkey", "Enabled", d.textHotkeyEnabled);
+    c.textHotkeyToggleKey = ReadKey("TextHotkey", "ToggleKey", d.textHotkeyToggleKey);
+    float cooldown = ReadFloat("TextHotkey", "Cooldown", d.textHotkeyCooldown);
+    c.textHotkeyCooldown = cooldown < 0.0f ? 0.0f : cooldown;
+    c.textHotkeys = ReadTextHotkeys();
 
     c.sigGetFov = ReadString("Signatures", "GetFov", "");
     c.sigKeyboardFeed = ReadString("Signatures", "KeyboardFeed", "");
     c.sigMouseFeed = ReadString("Signatures", "MouseFeed", "");
+    c.sigGetGamma = ReadString("Signatures", "GetGamma", "");
 
-    // Keep the numbers sane so a typo cannot produce a 0 or negative FOV.
-    if (c.zoomMinFactor < 1.0f) c.zoomMinFactor = 1.0f;
-    if (c.zoomMaxFactor < c.zoomMinFactor) c.zoomMaxFactor = c.zoomMinFactor;
-    if (c.zoomFactor < c.zoomMinFactor) c.zoomFactor = c.zoomMinFactor;
-    if (c.zoomFactor > c.zoomMaxFactor) c.zoomFactor = c.zoomMaxFactor;
-    if (c.zoomScrollStep <= 1.0f) c.zoomScrollStep = 1.25f;
-    if (c.zoomSmoothSpeed <= 0.0f) c.zoomSmooth = false;
-
-    logx::Info("Config: AutoSprint=%d (toggle %s, forward %s, sprint %s), Zoom=%d (key %s, %s, x%.2f), unload %s",
-               c.sprintEnabled, keys::Name(c.sprintToggleKey).c_str(), keys::Name(c.forwardKey).c_str(),
-               keys::Name(c.sprintKey).c_str(), c.zoomEnabled, keys::Name(c.zoomKey).c_str(),
-               c.zoomToggle ? "toggle" : "hold", c.zoomFactor, keys::Name(c.unloadKey).c_str());
+    logx::Info("Config: prefix '%s', AutoSprint=%d [%s], Zoom=%d [%s, %s, x%.2f], Fullbright=%d [%s], "
+               "TextHotkeys=%zu, unload [%s]",
+               prefix.c_str(), c.sprintEnabled.load(), keys::Name(c.sprintToggleKey).c_str(), c.zoomEnabled.load(),
+               keys::Name(c.zoomKey).c_str(), c.zoomToggle ? "toggle" : "hold", c.zoomFactor.load(),
+               c.fullbrightEnabled.load(), keys::Name(c.fullbrightToggleKey).c_str(), c.textHotkeys.size(),
+               keys::Name(c.unloadKey).c_str());
 }
+
+bool Set(const std::string& section, const std::string& key, const std::string& value) {
+    const bool ok = WritePrivateProfileStringW(text::Widen(section).c_str(), text::Widen(key).c_str(),
+                                               text::Widen(value).c_str(), g_path.c_str()) != FALSE;
+    if (!ok) logx::Error("Could not write [%s] %s to config.ini (error %lu)", section.c_str(), key.c_str(), GetLastError());
+    Reload();
+    return ok;
+}
+
+bool Remove(const std::string& section, const std::string& key) {
+    const bool ok = WritePrivateProfileStringW(text::Widen(section).c_str(), text::Widen(key).c_str(), nullptr,
+                                               g_path.c_str()) != FALSE;
+    Reload();
+    return ok;
+}
+
+std::string Get(const std::string& section, const std::string& key) { return ReadRaw(section, key, ""); }
+
+std::string Prefix() {
+    AcquireSRWLockShared(&g_prefixLock);
+    std::string copy = g_prefix;
+    ReleaseSRWLockShared(&g_prefixLock);
+    return copy;
+}
+
+const std::wstring& Directory() { return g_dir; }
+const std::wstring& Path() { return g_path; }
 
 }  // namespace config

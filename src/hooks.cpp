@@ -5,8 +5,11 @@
 #include <vector>
 
 #include "MinHook.h"
+#include "chat.h"
 #include "config.h"
+#include "events.h"
 #include "features/autosprint.h"
+#include "features/fullbright.h"
 #include "features/zoom.h"
 #include "game.h"
 #include "log.h"
@@ -28,17 +31,27 @@ const std::vector<const char*> kKeyboardFeedSigs = {
 const std::vector<const char*> kMouseFeedSigs = {
     "E8 ? ? ? ? 40 88 6C 1F",  // call MouseDevice::feed
 };
+// Options::getGamma, 1.21.5x only (the 0x1820 option offset changes between versions).
+const std::vector<const char*> kGetGammaSigs = {
+    "48 83 EC 28 80 B9 20 18 00 00 00 48 8D 54 24 30 48 8B 01 48 8B 40 60 74 38 41 B8 1A",
+};
+
+enum Slot { kSlotFov, kSlotKeyboard, kSlotMouse, kSlotGamma, kSlotCount };
 
 using GetFovFn = float (*)(void* self, float partialTicks, void* a3, void* a4);
 using MouseFeedFn = void (*)(void* device, char button, char action, short x, short y, short dx, short dy,
                              char a8);
+using GetGammaFn = float (*)(void* options);
 
 GetFovFn g_origGetFov = nullptr;
 autosprint::KeyFeedFn g_origKeyboardFeed = nullptr;
 MouseFeedFn g_origMouseFeed = nullptr;
+GetGammaFn g_origGetGamma = nullptr;
 
-void* g_targets[3] = {};
+void* g_targets[kSlotCount] = {};
 std::atomic<bool> g_unloading{false};
+std::atomic<bool> g_unloadRequested{false};
+std::atomic<ULONGLONG> g_unloadRequestedAt{0};
 std::atomic<bool> g_keyboardFallback{false};
 std::atomic<unsigned> g_keyboardEvents{0};
 HANDLE g_unloadEvent = nullptr;
@@ -52,6 +65,14 @@ float HookGetFov(void* self, float partialTicks, void* a3, void* a4) {
     const float fov = g_origGetFov(self, partialTicks, a3, a4);
     if (g_unloading.load(std::memory_order_relaxed)) return fov;
     return zoom::OnFov(fov);
+}
+
+// Runs on the input thread: releases what we hold in the game, then lets the worker unload us.
+void BeginUnload() {
+    autosprint::Release(g_origKeyboardFeed);
+    zoom::Reset();
+    g_unloading.store(true);
+    SetEvent(g_unloadEvent);
 }
 
 void HookKeyboardFeed(int key, int state) {
@@ -70,25 +91,31 @@ void HookKeyboardFeed(int key, int state) {
 
     const Config& cfg = g_config;
 
-    if (pressed && vk == cfg.unloadKey) {
-        autosprint::Release(g_origKeyboardFeed);
-        zoom::Reset();
-        g_unloading.store(true);
-        SetEvent(g_unloadEvent);
+    if (g_unloadRequested.load() || (pressed && vk == cfg.unloadKey && !chat::IsOpen())) {
+        BeginUnload();
         g_origKeyboardFeed(key, state);
         return;
     }
 
-    if (pressed && vk == cfg.sprintToggleKey && game::InWorld()) autosprint::Toggle();
+    // Chat first: it decides whether the chat is open, which gates everything below.
+    if (chat::OnKey(vk, down, g_origKeyboardFeed)) return;
+
+    const bool inWorld = game::InWorld();
     if (changed && vk == cfg.zoomKey) {
-        const bool inWorld = game::InWorld();
         static bool hinted = false;
-        if (pressed && !inWorld && !hinted) {
+        if (pressed && !inWorld && !chat::IsOpen() && !hinted) {
             hinted = true;
-            logx::Info("Zoom key ignored: the mouse cursor is visible (menu/chat open). If this happens while "
+            logx::Info("Zoom key ignored: the mouse cursor is visible (menu open). If this happens while "
                        "you are in the world, set RequireHiddenCursor=0 in config.ini");
         }
         zoom::OnKey(down, inWorld);
+    }
+
+    if (pressed && inWorld) {
+        events::Event event;
+        event.type = events::Type::KeyPress;
+        event.vk = vk;
+        events::Push(event);
     }
 
     if (autosprint::OnKeyEvent(vk, down, g_origKeyboardFeed)) return;
@@ -96,11 +123,21 @@ void HookKeyboardFeed(int key, int state) {
 }
 
 void HookMouseFeed(void* device, char button, char action, short x, short y, short dx, short dy, char a8) {
-    // button 4 = mouse wheel, action = signed wheel delta (0x78 = up, 0x88 = down).
-    if (button == 4 && !g_unloading.load(std::memory_order_relaxed)) {
-        if (zoom::OnScroll(static_cast<signed char>(action), game::InWorld())) return;
+    if (!g_unloading.load(std::memory_order_relaxed)) {
+        // button 4 = mouse wheel, action = signed wheel delta (0x78 = up, 0x88 = down).
+        if (button == 4) {
+            if (zoom::OnScroll(static_cast<signed char>(action), game::InWorld())) return;
+        } else if ((button == 1 || button == 2) && action == 1) {
+            chat::OnMouseClick();
+        }
     }
     g_origMouseFeed(device, button, action, x, y, dx, dy, a8);
+}
+
+float HookGetGamma(void* options) {
+    const float gamma = g_origGetGamma(options);
+    if (g_unloading.load(std::memory_order_relaxed)) return gamma;
+    return fullbright::OnGamma(gamma);
 }
 
 // --- Installation ------------------------------------------------------------------------
@@ -169,23 +206,25 @@ bool Install() {
     }
     logx::Info(".text: 0x%llX bytes", static_cast<unsigned long long>(text.size));
 
-    if (g_config.zoomEnabled) {
-        const uintptr_t fov = Resolve("LevelRendererPlayer::getFov", g_config.sigGetFov, kGetFovSigs, text);
-        Create(0, "LevelRendererPlayer::getFov", fov, reinterpret_cast<void*>(&HookGetFov),
-               reinterpret_cast<void**>(&g_origGetFov));
+    // All hooks are installed regardless of which features are enabled, so features can be
+    // switched on later from chat without restarting the game.
+    const uintptr_t fov = Resolve("LevelRendererPlayer::getFov", g_config.sigGetFov, kGetFovSigs, text);
+    Create(kSlotFov, "LevelRendererPlayer::getFov", fov, reinterpret_cast<void*>(&HookGetFov),
+           reinterpret_cast<void**>(&g_origGetFov));
 
-        if (g_config.zoomScrollAdjust) {
-            const uintptr_t mouse = Resolve("MouseDevice::feed", g_config.sigMouseFeed, kMouseFeedSigs, text);
-            Create(2, "MouseDevice::feed", mouse, reinterpret_cast<void*>(&HookMouseFeed),
-                   reinterpret_cast<void**>(&g_origMouseFeed));
-        }
-    }
+    const uintptr_t mouse = Resolve("MouseDevice::feed", g_config.sigMouseFeed, kMouseFeedSigs, text);
+    Create(kSlotMouse, "MouseDevice::feed", mouse, reinterpret_cast<void*>(&HookMouseFeed),
+           reinterpret_cast<void**>(&g_origMouseFeed));
+
+    const uintptr_t gamma = Resolve("Options::getGamma", g_config.sigGetGamma, kGetGammaSigs, text);
+    Create(kSlotGamma, "Options::getGamma", gamma, reinterpret_cast<void*>(&HookGetGamma),
+           reinterpret_cast<void**>(&g_origGetGamma));
 
     const uintptr_t keyboard = Resolve("Keyboard::feed", g_config.sigKeyboardFeed, kKeyboardFeedSigs, text);
-    Create(1, "Keyboard::feed", keyboard, reinterpret_cast<void*>(&HookKeyboardFeed),
+    Create(kSlotKeyboard, "Keyboard::feed", keyboard, reinterpret_cast<void*>(&HookKeyboardFeed),
            reinterpret_cast<void**>(&g_origKeyboardFeed));
     if (!HasKeyboardHook()) {
-        logx::Warn("Keyboard hook unavailable - using the polling fallback for keys");
+        logx::Warn("Keyboard hook unavailable - using the polling fallback for keys (no chat commands)");
         g_keyboardFallback.store(true);
     }
     return true;
@@ -203,9 +242,27 @@ void Uninstall() {
     }
 }
 
-bool HasFovHook() { return g_targets[0] != nullptr; }
-bool HasKeyboardHook() { return g_targets[1] != nullptr; }
-bool HasMouseHook() { return g_targets[2] != nullptr; }
+bool HasFovHook() { return g_targets[kSlotFov] != nullptr; }
+bool HasKeyboardHook() { return g_targets[kSlotKeyboard] != nullptr; }
+bool HasMouseHook() { return g_targets[kSlotMouse] != nullptr; }
+bool HasGammaHook() { return g_targets[kSlotGamma] != nullptr; }
+
+void RequestUnload() {
+    if (g_keyboardFallback.load() || !HasKeyboardHook()) {
+        g_unloading.store(true);
+        SetEvent(g_unloadEvent);
+        return;
+    }
+    // Let the input thread release the sprint key on its next key event (see HookKeyboardFeed);
+    // the worker forces the unload if no key event arrives in time.
+    g_unloadRequestedAt.store(GetTickCount64());
+    g_unloadRequested.store(true);
+}
+
+bool UnloadRequestTimedOut() {
+    const ULONGLONG at = g_unloadRequestedAt.load();
+    return g_unloadRequested.load() && at != 0 && GetTickCount64() - at > 1500;
+}
 
 unsigned KeyboardEventCount() { return g_keyboardEvents.load(std::memory_order_relaxed); }
 

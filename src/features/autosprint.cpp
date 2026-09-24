@@ -6,12 +6,9 @@
 
 #include "../config.h"
 #include "../game.h"
-#include "../log.h"
 
 namespace autosprint {
 namespace {
-
-std::atomic<int> g_enabled{-1};  // -1 = take the value from the config on first use
 
 // Hook-mode state, only touched on the game's input thread.
 bool g_forwardDown = false;
@@ -21,14 +18,7 @@ bool g_injected = false;  // the game currently believes the sprint key is held 
 // Fallback-mode state, only touched on the worker thread.
 bool g_sendInputHeld = false;
 
-bool Enabled() {
-    int v = g_enabled.load();
-    if (v < 0) {
-        v = g_config.sprintEnabled ? 1 : 0;
-        g_enabled.store(v);
-    }
-    return v == 1;
-}
+bool Enabled() { return g_config.sprintEnabled.load(std::memory_order_relaxed); }
 
 bool Configured() {
     return g_config.forwardKey > 0 && g_config.sprintKey > 0 && g_config.forwardKey != g_config.sprintKey;
@@ -44,12 +34,6 @@ void SendKey(int vk, bool down) {
 }
 
 }  // namespace
-
-void Toggle() {
-    const bool now = !Enabled();
-    g_enabled.store(now ? 1 : 0);
-    logx::Info("AutoSprint %s", now ? "enabled" : "disabled");
-}
 
 bool OnKeyEvent(int vk, bool down, KeyFeedFn feed) {
     if (!Configured()) return false;

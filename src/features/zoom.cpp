@@ -26,7 +26,7 @@ LARGE_INTEGER g_frequency{};
 
 float Factor() {
     float f = g_factor.load(std::memory_order_relaxed);
-    return f > 0.0f ? f : g_config.zoomFactor;
+    return f > 0.0f ? f : g_config.zoomFactor.load();
 }
 
 void Start() {

@@ -5,6 +5,7 @@
 
 #include <atomic>
 
+#include "chat.h"
 #include "config.h"
 
 namespace game {
@@ -25,13 +26,6 @@ std::wstring CallPackageApi(const char* name) {
 bool EnsureDirectory(const std::wstring& path) {
     if (CreateDirectoryW(path.c_str(), nullptr)) return true;
     return GetLastError() == ERROR_ALREADY_EXISTS;
-}
-
-bool IsCursorHidden() {
-    CURSORINFO info{};
-    info.cbSize = sizeof(info);
-    if (!GetCursorInfo(&info)) return true;  // unknown: don't block features
-    return (info.flags & CURSOR_SHOWING) == 0;
 }
 
 bool IsOurWindow(HWND hwnd) {
@@ -68,9 +62,17 @@ std::wstring DataDirectory() {
     return L".";
 }
 
+bool CursorHidden() {
+    CURSORINFO info{};
+    info.cbSize = sizeof(info);
+    if (!GetCursorInfo(&info)) return true;  // unknown: don't block features
+    return (info.flags & CURSOR_SHOWING) == 0;
+}
+
 bool InWorld() {
+    if (chat::IsOpen()) return false;
     if (!g_config.requireHiddenCursor) return true;
-    return IsCursorHidden();
+    return CursorHidden();
 }
 
 bool InWorldCached() {

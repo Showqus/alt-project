@@ -14,6 +14,12 @@ void Uninstall();
 bool HasFovHook();
 bool HasKeyboardHook();
 bool HasMouseHook();
+bool HasGammaHook();
+
+// Unload from the worker thread (chat command, launcher update). The sprint key is released on
+// the input thread first when possible.
+void RequestUnload();
+bool UnloadRequestTimedOut();
 
 // Number of Keyboard::feed calls seen so far (used to detect a hook that never fires).
 unsigned KeyboardEventCount();

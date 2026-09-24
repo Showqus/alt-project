@@ -20,31 +20,68 @@ jobs:
           name: BedrockQoL-msvc
           path: |
             build/Release/BedrockQoL.dll
-            build/Release/BedrockQoLInjector.exe
+            build/Release/BedrockQoLLauncher.exe
 
   mingw:
-    name: MinGW + smoke test (Wine)
+    name: MinGW + tests (Wine)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends mingw-w64 wine64 ninja-build
-      - name: Configure
-        run: cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-x86_64.cmake
+          sudo apt-get install -y --no-install-recommends mingw-w64 wine64 ninja-build xvfb xauth
       - name: Build
-        run: cmake --build build
-      - name: Smoke test
+        run: |
+          VERSION="${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-x86_64.cmake -DBEDROCKQOL_VERSION="$VERSION"
+          cmake --build build
+          # Two extra builds with fixed versions for the auto-update test.
+          for v in 1 2; do
+            cmake -B build-v$v -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-x86_64.cmake -DBEDROCKQOL_VERSION=test-$v
+            cmake --build build-v$v --target BedrockQoL
+          done
+      - name: DLL test (fake game)
         working-directory: build
         env:
           WINEDEBUG: -all
         run: |
           /usr/lib/wine/wine64 wineboot -i || true
-          /usr/lib/wine/wine64 fake_game.exe BedrockQoL.dll
+          xvfb-run -a /usr/lib/wine/wine64 fake_game.exe BedrockQoL.dll
+      - name: Launcher / auto-update test
+        run: tests/launcher_test.sh build build-v1/BedrockQoL.dll build-v2/BedrockQoL.dll
       - uses: actions/upload-artifact@v4
         with:
           name: BedrockQoL-mingw
           path: |
             build/BedrockQoL.dll
-            build/BedrockQoLInjector.exe
+            build/BedrockQoLLauncher.exe
+
+  # The launcher downloads release "latest" (manifest.txt + BedrockQoL.dll) and reloads the new DLL
+  # into the running game, so every push to main reaches players automatically.
+  release:
+    name: Publish "latest" release
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: [msvc, mingw]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: BedrockQoL-mingw
+          path: dist
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          VERSION="${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          cd dist
+          printf 'version=%s\nfile=BedrockQoL.dll\nsha256=%s\n' "$VERSION" "$(sha256sum BedrockQoL.dll | cut -d' ' -f1)" > manifest.txt
+          cat manifest.txt
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest BedrockQoL.dll BedrockQoLLauncher.exe manifest.txt \
+            --target "$GITHUB_SHA" --latest \
+            --title "BedrockQoL $VERSION" \
+            --notes "Автоматическая сборка из коммита $GITHUB_SHA. BedrockQoLLauncher.exe скачивает её сам."

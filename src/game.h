@@ -10,8 +10,11 @@ std::wstring PackageFullName();
 // Folder the DLL can write its config/log into (created if needed).
 std::wstring DataDirectory();
 
-// True when the mouse cursor is hidden, i.e. the player is in the world and not in a menu/chat.
-// Honors Config::requireHiddenCursor (always true when that option is off).
+// True when the mouse cursor is hidden (the game hides it while you are in the world).
+bool CursorHidden();
+
+// True when the player is in the world and not in a menu or the chat: the chat is not open and,
+// if Config::requireHiddenCursor is on, the cursor is hidden.
 bool InWorld();
 
 // Cheaper variant for per-frame use: re-checks the cursor at most every ~50 ms.
