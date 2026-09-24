@@ -67,7 +67,7 @@ bool SendChatMessage(const std::string& utf8Text) {
 bool OnKeyPress(int vk) {
     for (const TextHotkeyEntry& entry : g_config.textHotkeys) {
         if (entry.key != vk) continue;
-        if (!g_config.textHotkeyEnabled) return true;
+        if (!g_config.textHotkeyEnabled || entry.text.empty()) return true;
 
         // Text that starts with the command prefix runs locally (a "command hotkey").
         const std::string prefix = config::Prefix();

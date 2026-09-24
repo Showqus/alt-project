@@ -10,6 +10,9 @@
 
 #include "config.h"
 #include "features/texthotkey.h"
+#include "gui/overlay.h"
+#include "gui/state.h"
+#include "gui/theme.h"
 #include "hooks.h"
 #include "keys.h"
 #include "log.h"
@@ -44,6 +47,7 @@ const std::vector<Function> kFunctions = {
     {"texthotkey", {"th", "texthotkeys"}, "TextHotkey", "ToggleKey", "Enabled", "TextHotkey",
      &Config::textHotkeyToggleKey, &Config::textHotkeyEnabled},
     {"unload", {"eject", "выгрузить"}, "General", "UnloadKey", nullptr, "Выгрузка мода", &Config::unloadKey, nullptr},
+    {"menu", {"gui", "clickgui", "меню"}, "Menu", "Key", nullptr, "Меню", &Config::menuKey, nullptr},
 };
 
 std::string LowerUtf8(const std::string& s) {
@@ -151,6 +155,8 @@ void Help() {
                  p + "prefix <новый префикс>\n" +
                  p + "th add <клавиша> <текст>, " + p + "th remove <номер|клавиша>, " + p + "th list\n" +
                  p + "config save|load|delete|export|import <имя>, " + p + "config list\n" +
+                 p + "menu (меню, клавиша " + keys::Name(g_config.menuKey) + "), " + p +
+                 "theme save|load|delete <имя>, " + p + "theme list|reset|preset <имя>\n" +
                  p + "set <Секция.Ключ> <значение>, " + p + "get <Секция.Ключ>\n" +
                  p + "unload, " + p + "version\n" +
                  "Функции: " + FunctionList());
@@ -385,6 +391,108 @@ void GetCmd(const std::vector<std::string>& args) {
     notify::Send(section + "." + key + " = " + config::Get(section, key));
 }
 
+// --- Menu themes (JSON files in BedrockQoL\themes) ----------------------------------------
+
+bool ReadText(const std::wstring& path, std::string& out) {
+    FILE* f = _wfopen(path.c_str(), L"rb");
+    if (!f) return false;
+    char buffer[4096];
+    size_t n;
+    out.clear();
+    while ((n = fread(buffer, 1, sizeof(buffer), f)) > 0) out.append(buffer, n);
+    fclose(f);
+    if (out.compare(0, 3, "\xEF\xBB\xBF") == 0) out.erase(0, 3);
+    return true;
+}
+
+// Applies a theme (colors, sizes, font, background) to config.ini, keeping the menu preferences.
+void ApplyTheme(const gui::Theme& theme) { config::Apply(gui::ThemeToIni(theme, true)); }
+
+void ThemeCmd(const std::vector<std::string>& args) {
+    const std::string p = config::Prefix();
+    const std::string sub = args.size() >= 2 ? text::Lower(args[1]) : "list";
+    const std::string name = args.size() >= 3 ? Join(args, 2) : "";
+    const gui::Theme current = gui::Latest()->theme;
+
+    if (sub == "list") {
+        std::string presets;
+        for (const gui::Preset& preset : gui::Presets()) presets += (presets.empty() ? "" : ", ") + std::string(preset.name);
+        std::string saved;
+        WIN32_FIND_DATAW data;
+        HANDLE find = FindFirstFileW((SubDir(L"themes") + L"\\*.json").c_str(), &data);
+        if (find != INVALID_HANDLE_VALUE) {
+            do {
+                std::wstring file = data.cFileName;
+                file.resize(file.size() - 5);
+                saved += (saved.empty() ? "" : ", ") + text::Narrow(file);
+            } while (FindNextFileW(find, &data));
+            FindClose(find);
+        }
+        notify::Send("Темы: " + (saved.empty() ? std::string("нет") : saved) + "\nВстроенные (" + p +
+                     "theme preset <имя>): " + presets);
+        return;
+    }
+    if (sub == "reset") {
+        gui::Theme theme = gui::DefaultTheme();
+        ApplyTheme(theme);
+        notify::Send("Внешний вид меню сброшен");
+        return;
+    }
+    if (sub == "preset") {
+        for (const gui::Preset& preset : gui::Presets()) {
+            if (LowerUtf8(preset.name) == LowerUtf8(name)) {
+                gui::Theme theme = current;
+                const gui::Theme look = preset.make();
+                theme.style = look.style;
+                std::copy(std::begin(look.custom), std::end(look.custom), std::begin(theme.custom));
+                ApplyTheme(theme);
+                notify::Send(std::string("Тема: ") + preset.name);
+                return;
+            }
+        }
+        notify::Send("Нет такой встроенной темы: " + name + ". Список: " + p + "theme list");
+        return;
+    }
+    if (name.empty() || !ValidProfileName(name)) {
+        notify::Send("Использование: " + p + "theme save|load|delete <имя>, " + p + "theme list|reset|preset <имя>");
+        return;
+    }
+    const std::wstring path = SubDir(L"themes") + L"\\" + text::Widen(name) + L".json";
+    if (sub == "save" || sub == "export") {
+        const std::string json = gui::ThemeToJson(current, name);
+        FILE* f = _wfopen(path.c_str(), L"wb");
+        const bool ok = f && fwrite(json.data(), 1, json.size(), f) == json.size();
+        if (f) fclose(f);
+        notify::Send(ok ? "Тема '" + name + "' сохранена" : "Не удалось сохранить тему '" + name + "'");
+    } else if (sub == "load" || sub == "import") {
+        std::string json;
+        if (!ReadText(path, json)) {
+            notify::Send("Тема '" + name + "' не найдена (файл themes\\" + name + ".json)");
+            return;
+        }
+        gui::Theme theme = current;
+        std::string error;
+        if (!gui::ThemeFromJson(json, theme, error)) {
+            notify::Send("Тема '" + name + "' не загружена: " + error);
+            return;
+        }
+        ApplyTheme(theme);
+        notify::Send("Тема '" + name + "' загружена");
+    } else if (sub == "delete" || sub == "remove") {
+        notify::Send(DeleteFileW(path.c_str()) ? "Тема '" + name + "' удалена" : "Тема '" + name + "' не найдена");
+    } else {
+        notify::Send("Использование: " + p + "theme save|load|delete <имя>, " + p + "theme list|reset|preset <имя>");
+    }
+}
+
+void MenuCmd() {
+    if (!gui::overlay::Ready()) {
+        notify::Send("Меню недоступно: " + gui::overlay::Status());
+        return;
+    }
+    gui::SetMenuOpen(!gui::MenuOpen());
+}
+
 }  // namespace
 
 void Execute(const std::string& line) {
@@ -418,6 +526,10 @@ void Execute(const std::string& line) {
     } else if (cmd == "unload" || cmd == "eject") {
         notify::Send("BedrockQoL выгружается");
         hooks::RequestUnload();
+    } else if (cmd == "menu" || cmd == "gui" || cmd == "clickgui" || cmd == "меню") {
+        MenuCmd();
+    } else if (cmd == "theme" || cmd == "тема") {
+        ThemeCmd(args);
     } else if (cmd == "version" || cmd == "ver") {
         notify::Send(std::string("BedrockQoL ") + BEDROCKQOL_VERSION);
     } else if (const Function* f = FindFunction(cmd); f && f->enabledEntry) {

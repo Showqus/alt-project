@@ -7,6 +7,7 @@
 
 #include "chat.h"
 #include "config.h"
+#include "gui/state.h"
 
 namespace game {
 namespace {
@@ -70,7 +71,7 @@ bool CursorHidden() {
 }
 
 bool InWorld() {
-    if (chat::IsOpen()) return false;
+    if (chat::IsOpen() || gui::MenuOpen()) return false;
     if (!g_config.requireHiddenCursor) return true;
     return CursorHidden();
 }

@@ -12,6 +12,9 @@ using KeyFeedFn = void (*)(int key, int state);
 // Keyboard::feed, used to close the chat with Escape.
 bool OnKey(int vk, bool down, KeyFeedFn feed);
 
+// Keeps Shift/Ctrl/Alt in sync for key events that OnKey does not see (the menu swallowed them).
+void TrackModifiers(int vk, bool down);
+
 // A mouse click inside the chat moves the text cursor to an unknown position.
 void OnMouseClick();
 

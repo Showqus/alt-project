@@ -13,7 +13,8 @@ std::wstring DataDirectory();
 // True when the mouse cursor is hidden (the game hides it while you are in the world).
 bool CursorHidden();
 
-// True when the player is in the world and not in a menu or the chat: the chat is not open and,
+// True when the player is in the world and not in a menu or the chat: neither the chat nor the mod's
+// menu is open and,
 // if Config::requireHiddenCursor is on, the cursor is hidden.
 bool InWorld();
 

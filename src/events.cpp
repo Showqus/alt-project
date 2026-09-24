@@ -14,7 +14,8 @@ std::deque<Event> g_queue;
 
 void Push(const Event& event) {
     AcquireSRWLockExclusive(&g_lock);
-    if (g_queue.size() < 256) g_queue.push_back(event);
+    // Key presses may be dropped when the worker falls behind; commands and settings never are.
+    if (g_queue.size() < 256 || event.type != Type::KeyPress) g_queue.push_back(event);
     ReleaseSRWLockExclusive(&g_lock);
 }
 

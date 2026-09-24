@@ -8,6 +8,7 @@
 #include "config.h"
 #include "events.h"
 #include "game.h"
+#include "keys.h"
 #include "log.h"
 #include "text.h"
 
@@ -75,26 +76,11 @@ void Paste() {
 }
 
 void TypeCharacter(int vk) {
-    BYTE state[256] = {};
-    if (g_shift) state[VK_SHIFT] = state[VK_LSHIFT] = 0x80;
-    if (g_ctrl) state[VK_CONTROL] = state[VK_LCONTROL] = 0x80;
-    if (g_alt) state[VK_MENU] = state[VK_RMENU] = 0x80;
-    if (GetKeyState(VK_CAPITAL) & 1) state[VK_CAPITAL] = 0x01;
-    if (GetKeyState(VK_NUMLOCK) & 1) state[VK_NUMLOCK] = 0x01;
-
-    HKL layout = GetKeyboardLayout(0);
-    const UINT scan = MapVirtualKeyExW(static_cast<UINT>(vk), MAPVK_VK_TO_VSC, layout);
-    wchar_t out[8] = {};
-    // Flag 0x4: do not change the keyboard (dead key) state of the thread.
-    const int n = ToUnicodeEx(static_cast<UINT>(vk), scan, state, out, 8, 0x4, layout);
-    if (n < 0) {
+    std::wstring chars;
+    if (!keys::Translate(vk, g_shift, g_ctrl, g_alt, chars)) {
         g_valid = false;  // dead key: the composed character is unknown
-    } else if (n > 0) {
-        std::wstring chars;
-        for (int i = 0; i < n; ++i) {
-            if (out[i] >= 0x20) chars += out[i];
-        }
-        if (!chars.empty()) Insert(chars);
+    } else if (!chars.empty()) {
+        Insert(chars);
     }
 }
 
@@ -119,7 +105,7 @@ bool Submit(KeyFeedFn feed) {
 
 }  // namespace
 
-bool OnKey(int vk, bool down, KeyFeedFn feed) {
+void TrackModifiers(int vk, bool down) {
     switch (vk) {
         case VK_SHIFT:
         case VK_LSHIFT:
@@ -132,6 +118,10 @@ bool OnKey(int vk, bool down, KeyFeedFn feed) {
         case VK_RMENU: g_alt = down; break;
         default: break;
     }
+}
+
+bool OnKey(int vk, bool down, KeyFeedFn feed) {
+    TrackModifiers(vk, down);
     if (!down) return false;
 
     if (g_open && g_config.requireHiddenCursor && game::CursorHidden() && GetTickCount64() - g_openedAt > 400) {

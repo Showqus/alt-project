@@ -12,6 +12,9 @@
 #include "features/fullbright.h"
 #include "features/zoom.h"
 #include "game.h"
+#include "gui/input.h"
+#include "gui/overlay.h"
+#include "gui/state.h"
 #include "log.h"
 #include "scanner.h"
 
@@ -59,12 +62,39 @@ HANDLE g_unloadEvent = nullptr;
 // Key state seen through Keyboard::feed, used to turn auto-repeat into clean press edges.
 bool g_keyState[256] = {};
 
+// Mouse state seen through MouseDevice::feed (input thread), to release held buttons for the menu.
+void* g_mouseDevice = nullptr;
+bool g_mouseHeld[4] = {};
+short g_mouseX = 0;
+short g_mouseY = 0;
+std::atomic<bool> g_menuReleased{false};
+
 // --- Detours -----------------------------------------------------------------------------
 
 float HookGetFov(void* self, float partialTicks, void* a3, void* a4) {
     const float fov = g_origGetFov(self, partialTicks, a3, a4);
     if (g_unloading.load(std::memory_order_relaxed)) return fov;
     return zoom::OnFov(fov);
+}
+
+// Input thread: when the menu opens (menu key, or the .menu command from the worker), the game must
+// not keep walking, sprinting, zooming or mining with keys it saw go down before.
+void SyncMenu() {
+    const bool open = gui::MenuOpen();
+    if (g_menuReleased.exchange(open) == open || !open) return;
+    if (g_origKeyboardFeed && !g_keyboardFallback.load()) {
+        autosprint::Release(g_origKeyboardFeed);
+        for (int vk = 1; vk < 256; ++vk) {
+            if (g_keyState[vk]) g_origKeyboardFeed(vk, 0);
+        }
+    }
+    zoom::OnKey(false, false);
+    if (g_origMouseFeed && g_mouseDevice) {
+        for (char button = 1; button <= 3; ++button) {
+            if (!g_mouseHeld[static_cast<int>(button)]) continue;
+            g_origMouseFeed(g_mouseDevice, button, 0, g_mouseX, g_mouseY, 0, 0, 0);
+        }
+    }
 }
 
 // Runs on the input thread: releases what we hold in the game, then lets the worker unload us.
@@ -91,7 +121,21 @@ void HookKeyboardFeed(int key, int state) {
 
     const Config& cfg = g_config;
 
-    if (g_unloadRequested.load() || (pressed && vk == cfg.unloadKey && !chat::IsOpen())) {
+    if (g_unloadRequested.load()) {
+        BeginUnload();
+        g_origKeyboardFeed(key, state);
+        return;
+    }
+
+    // The menu: its key opens it, and while it is open every key belongs to it.
+    SyncMenu();
+    if (gui::input::OnKey(vk, down, pressed)) {
+        chat::TrackModifiers(vk, down);
+        SyncMenu();
+        return;
+    }
+
+    if (pressed && vk == cfg.unloadKey && !chat::IsOpen()) {
         BeginUnload();
         g_origKeyboardFeed(key, state);
         return;
@@ -124,6 +168,13 @@ void HookKeyboardFeed(int key, int state) {
 
 void HookMouseFeed(void* device, char button, char action, short x, short y, short dx, short dy, char a8) {
     if (!g_unloading.load(std::memory_order_relaxed)) {
+        g_mouseDevice = device;
+        g_mouseX = x;
+        g_mouseY = y;
+        if (button >= 1 && button <= 3) g_mouseHeld[static_cast<int>(button)] = action != 0;
+        SyncMenu();
+        if (gui::input::OnMouse(button, action, x, y, dx, dy)) return;
+
         // button 4 = mouse wheel, action = signed wheel delta (0x78 = up, 0x88 = down).
         if (button == 4) {
             if (zoom::OnScroll(static_cast<signed char>(action), game::InWorld())) return;
@@ -227,6 +278,9 @@ bool Install() {
         logx::Warn("Keyboard hook unavailable - using the polling fallback for keys (no chat commands)");
         g_keyboardFallback.store(true);
     }
+
+    // The in-game menu (IDXGISwapChain::Present).
+    gui::overlay::Install();
     return true;
 }
 

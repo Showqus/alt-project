@@ -34,6 +34,8 @@ enum MenuId : UINT {
     kMenuOpenFolder,
     kMenuImport,
     kMenuExport,
+    kMenuBackground,
+    kMenuFont,
     kMenuAutostart,
     kMenuExit,
 };
@@ -149,6 +151,44 @@ void ExportConfig() {
                                                        : L"Не удалось экспортировать конфиг");
 }
 
+// The game runs sandboxed (UWP) and can only read files inside its own folder, so pictures and fonts
+// for the in-game menu are copied into BedrockQoL\images / BedrockQoL\fonts and selected there.
+void ImportMenuFile(bool font) {
+    wchar_t file[MAX_PATH] = {};
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_window;
+    ofn.lpstrFilter = font ? L"Шрифты (*.ttf, *.otf)\0*.ttf;*.otf;*.ttc\0Все файлы\0*.*\0"
+                           : L"Картинки (*.png, *.jpg, *.bmp, *.tga, *.gif)\0*.png;*.jpg;*.jpeg;*.bmp;*.tga;*.gif\0"
+                             L"Все файлы\0*.*\0";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = font ? L"Шрифт для меню BedrockQoL" : L"Фон для меню BedrockQoL";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&ofn)) return;
+
+    std::wstring name = file;
+    const size_t slash = name.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) name = name.substr(slash + 1);
+    const std::wstring data = GameDataDirectory();
+    const std::wstring dir = data + (font ? L"\\fonts" : L"\\images");
+    CreateDirectoryW(data.c_str(), nullptr);
+    CreateDirectoryW(dir.c_str(), nullptr);
+    if (!CopyFileW(file, (dir + L"\\" + name).c_str(), FALSE)) {
+        ShowBalloon(L"Не удалось скопировать файл в " + dir);
+        return;
+    }
+
+    const std::wstring key = font ? L"Font" : L"Background";
+    const DWORD pid = FindProcess(g_settings.processName);
+    if (pid && !LoadedModDll(pid).empty()) {
+        SendGameCommand("set Menu." + Narrow(key) + " " + Narrow(name));  // the mod reloads and reports back
+    } else {
+        WritePrivateProfileStringW(L"Menu", key.c_str(), name.c_str(), (data + L"\\config.ini").c_str());
+        ShowBalloon((font ? L"Шрифт меню: " : L"Фон меню: ") + name);
+    }
+}
+
 void ShowMenu() {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, kMenuInject, L"Загрузить мод в игру");
@@ -158,6 +198,8 @@ void ShowMenu() {
     AppendMenuW(menu, MF_STRING, kMenuOpenFolder, L"Открыть папку настроек");
     AppendMenuW(menu, MF_STRING, kMenuImport, L"Импорт конфига...");
     AppendMenuW(menu, MF_STRING, kMenuExport, L"Экспорт конфига...");
+    AppendMenuW(menu, MF_STRING, kMenuBackground, L"Фон для меню игры...");
+    AppendMenuW(menu, MF_STRING, kMenuFont, L"Шрифт для меню игры...");
     AppendMenuW(menu, MF_STRING | (AutostartEnabled() ? MF_CHECKED : 0), kMenuAutostart, L"Запускать вместе с Windows");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kMenuExit, L"Выход");
@@ -195,6 +237,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
                 case kMenuImport: ImportConfig(); break;
                 case kMenuExport: ExportConfig(); break;
+                case kMenuBackground: ImportMenuFile(false); break;
+                case kMenuFont: ImportMenuFile(true); break;
                 case kMenuAutostart: SetAutostart(!AutostartEnabled()); break;
                 case kMenuExit: DestroyWindow(hwnd); break;
                 default: break;

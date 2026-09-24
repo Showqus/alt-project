@@ -4,6 +4,7 @@
 
 #include <cstdio>
 
+#include "gui/state.h"
 #include "log.h"
 
 namespace notify {
@@ -34,6 +35,7 @@ void Send(const std::string& message) {
     }
 
     logx::Info("[notify] %s", message.c_str());
+    gui::PushToast(message);
     if (g_path.empty()) return;
 
     AcquireSRWLockExclusive(&g_lock);

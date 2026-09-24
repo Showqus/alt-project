@@ -30,7 +30,9 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends mingw-w64 wine64 ninja-build xvfb xauth
+          # Mesa: OpenGL (wined3d, Direct3D 11) and lavapipe Vulkan (vkd3d, Direct3D 12) under Xvfb.
+          sudo apt-get install -y --no-install-recommends mingw-w64 wine64 ninja-build xvfb xauth \
+            libgl1-mesa-dri libglx-mesa0 mesa-vulkan-drivers
       - name: Build
         run: |
           VERSION="${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
@@ -41,13 +43,22 @@ jobs:
             cmake -B build-v$v -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-x86_64.cmake -DBEDROCKQOL_VERSION=test-$v
             cmake --build build-v$v --target BedrockQoL
           done
-      - name: DLL test (fake game)
+      - name: DLL test (fake game, Direct3D 11)
         working-directory: build
         env:
           WINEDEBUG: -all
         run: |
           /usr/lib/wine/wine64 wineboot -i || true
+          # Let the Wine session started without a display end, so the test gets one with Xvfb.
+          /usr/lib/wine/wineserver -w
           xvfb-run -a /usr/lib/wine/wine64 fake_game.exe BedrockQoL.dll
+      - name: DLL test (fake game, Direct3D 12)
+        working-directory: build
+        env:
+          WINEDEBUG: -all
+        run: |
+          /usr/lib/wine/wineserver -w
+          xvfb-run -a /usr/lib/wine/wine64 fake_game.exe BedrockQoL.dll --d3d12
       - name: Launcher / auto-update test
         run: tests/launcher_test.sh build build-v1/BedrockQoL.dll build-v2/BedrockQoL.dll
       - uses: actions/upload-artifact@v4

@@ -67,6 +67,27 @@ int Parse(const std::string& raw) {
     return -1;
 }
 
+bool Translate(int vk, bool shift, bool ctrl, bool alt, std::wstring& out) {
+    BYTE state[256] = {};
+    if (shift) state[VK_SHIFT] = state[VK_LSHIFT] = 0x80;
+    if (ctrl) state[VK_CONTROL] = state[VK_LCONTROL] = 0x80;
+    if (alt) state[VK_MENU] = state[VK_RMENU] = 0x80;
+    if (GetKeyState(VK_CAPITAL) & 1) state[VK_CAPITAL] = 0x01;
+    if (GetKeyState(VK_NUMLOCK) & 1) state[VK_NUMLOCK] = 0x01;
+
+    HKL layout = GetKeyboardLayout(0);
+    const UINT scan = MapVirtualKeyExW(static_cast<UINT>(vk), MAPVK_VK_TO_VSC, layout);
+    wchar_t chars[8] = {};
+    // Flag 0x4: do not change the keyboard (dead key) state of the thread.
+    const int n = ToUnicodeEx(static_cast<UINT>(vk), scan, state, chars, 8, 0x4, layout);
+    out.clear();
+    if (n < 0) return false;
+    for (int i = 0; i < n; ++i) {
+        if (chars[i] >= 0x20 && chars[i] != 0x7F) out += chars[i];
+    }
+    return true;
+}
+
 std::string Name(int vk) {
     if (vk == 0) return "NONE";
     if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) return std::string(1, static_cast<char>(vk));

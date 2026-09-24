@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "gui/state.h"
 #include "keys.h"
 #include "log.h"
 #include "text.h"
@@ -28,6 +29,34 @@ const char kDefaultIni[] =
     "; 1 = only react while the mouse cursor is hidden (i.e. you are in the world,\n"
     ";     not in chat/inventory/menus). Set to 0 if features never activate.\n"
     "RequireHiddenCursor=1\n"
+    "\n"
+    "[Menu]\n"
+    "; In-game menu (modules, key binds, appearance, configs). Also opens with the .menu command.\n"
+    "Key=INSERT\n"
+    "; Font file: empty = built-in (Roboto), a name from BedrockQoL\\fonts or C:\\Windows\\Fonts\n"
+    "; (e.g. segoeui.ttf), or a full path. Size in pixels before Scale.\n"
+    "Font=\n"
+    "FontSize=17\n"
+    "; Size of the whole menu (0.5 - 2.5).\n"
+    "Scale=1.0\n"
+    "Width=860\n"
+    "Height=560\n"
+    "; Background picture: a PNG/JPG/BMP/TGA/GIF from BedrockQoL\\images (or a full path).\n"
+    "; Mode: fill, fit, stretch, center, tile. Target: window (inside the menu) or screen.\n"
+    "Background=\n"
+    "BackgroundMode=fill\n"
+    "BackgroundTarget=window\n"
+    "BackgroundOpacity=0.35\n"
+    "; Darken the game behind the menu (color: [Theme] ScreenDim).\n"
+    "DimScreen=1\n"
+    "; Show command results and toggles as notifications inside the game.\n"
+    "Notifications=1\n"
+    "; Fade the menu in and out.\n"
+    "Animations=1\n"
+    "\n"
+    "[Theme]\n"
+    "; Colors (#RRGGBBAA) and sizes of the menu. Only values that differ from the built-in theme are\n"
+    "; stored here; the menu (Appearance tab) edits them. Delete the section to reset the theme.\n"
     "\n"
     "[Chat]\n"
     "; Chat commands such as .bind / .toggle / .config. The message is not sent to the server.\n"
@@ -160,7 +189,8 @@ std::vector<TextHotkeyEntry> ReadTextHotkeys() {
         entry.id = text::Trim(line.substr(0, eq), " \t");
         entry.key = keys::Parse(line.substr(eq + 1, bar - eq - 1));
         entry.text = line.substr(bar + 1);
-        if (entry.key <= 0 || entry.text.empty()) {
+        // Entries without a key or text (just added in the menu) are kept but never fire.
+        if (entry.key < 0 || entry.id.empty()) {
             logx::Warn("Config [TextHotkeys] %s: bad entry '%s'", entry.id.c_str(), line.c_str());
             continue;
         }
@@ -237,6 +267,7 @@ void Reload() {
 
     c.unloadKey = ReadKey("General", "UnloadKey", d.unloadKey);
     c.requireHiddenCursor = ReadBool("General", "RequireHiddenCursor", d.requireHiddenCursor);
+    c.menuKey = ReadKey("Menu", "Key", d.menuKey);
 
     c.chatCommands = ReadBool("Chat", "Commands", d.chatCommands);
     c.chatOpenKey = ReadKey("Chat", "OpenKey", d.chatOpenKey);
@@ -295,11 +326,14 @@ void Reload() {
     c.sigGetGamma = ReadString("Signatures", "GetGamma", "");
 
     logx::Info("Config: prefix '%s', AutoSprint=%d [%s], Zoom=%d [%s, %s, x%.2f], Fullbright=%d [%s], "
-               "TextHotkeys=%zu, unload [%s]",
+               "TextHotkeys=%zu, menu [%s], unload [%s]",
                prefix.c_str(), c.sprintEnabled.load(), keys::Name(c.sprintToggleKey).c_str(), c.zoomEnabled.load(),
                keys::Name(c.zoomKey).c_str(), c.zoomToggle ? "toggle" : "hold", c.zoomFactor.load(),
                c.fullbrightEnabled.load(), keys::Name(c.fullbrightToggleKey).c_str(), c.textHotkeys.size(),
-               keys::Name(c.unloadKey).c_str());
+               keys::Name(c.menuKey).c_str(), keys::Name(c.unloadKey).c_str());
+
+    // Menu appearance ([Menu] + [Theme]) and the data the menu shows.
+    gui::OnConfigReloaded();
 }
 
 bool Set(const std::string& section, const std::string& key, const std::string& value) {
@@ -315,6 +349,52 @@ bool Remove(const std::string& section, const std::string& key) {
                                                g_path.c_str()) != FALSE;
     Reload();
     return ok;
+}
+
+bool Apply(const std::vector<ConfigEntry>& entries) {
+    bool ok = true;
+    for (const ConfigEntry& e : entries) {
+        const std::wstring section = text::Widen(e.section);
+        const std::wstring key = text::Widen(e.key);
+        BOOL written = FALSE;
+        switch (e.op) {
+            case ConfigEntry::Op::Set:
+                written = WritePrivateProfileStringW(section.c_str(), key.c_str(), text::Widen(e.value).c_str(),
+                                                     g_path.c_str());
+                break;
+            case ConfigEntry::Op::Remove:
+                written = WritePrivateProfileStringW(section.c_str(), key.c_str(), nullptr, g_path.c_str());
+                break;
+            case ConfigEntry::Op::RemoveSection:
+                written = WritePrivateProfileStringW(section.c_str(), nullptr, nullptr, g_path.c_str());
+                break;
+        }
+        if (!written) {
+            logx::Error("Could not write [%s] %s to config.ini (error %lu)", e.section.c_str(), e.key.c_str(),
+                        GetLastError());
+            ok = false;
+        }
+    }
+    Reload();
+    return ok;
+}
+
+std::vector<std::pair<std::string, std::string>> ReadSection(const std::string& section) {
+    std::vector<std::pair<std::string, std::string>> out;
+    std::vector<wchar_t> buffer(65536);
+    const DWORD len = GetPrivateProfileSectionW(text::Widen(section).c_str(), buffer.data(),
+                                                static_cast<DWORD>(buffer.size()), g_path.c_str());
+    for (const wchar_t* p = buffer.data(); p < buffer.data() + len && *p; p += wcslen(p) + 1) {
+        const std::string line = text::Narrow(p);
+        if (line.empty() || line[0] == ';' || line[0] == '#') continue;
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string value = line.substr(eq + 1);
+        const size_t comment = value.find(" ;");
+        if (comment != std::string::npos) value.erase(comment);
+        out.emplace_back(text::Trim(line.substr(0, eq), " \t"), text::Trim(value, " \t\""));
+    }
+    return out;
 }
 
 std::string Get(const std::string& section, const std::string& key) { return ReadRaw(section, key, ""); }

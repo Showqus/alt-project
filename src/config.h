@@ -10,12 +10,24 @@ struct TextHotkeyEntry {
     std::string text;  // UTF-8 text to send; if it starts with the command prefix it runs as a command
 };
 
+// One change to config.ini, used for batched writes from the menu.
+struct ConfigEntry {
+    enum class Op { Set, Remove, RemoveSection };
+    Op op = Op::Set;
+    std::string section;
+    std::string key;
+    std::string value;
+};
+
 // Scalars are atomic because they are read from game threads (input/render hooks) while the
 // worker thread may reload or change them.
 struct Config {
     // [General]
     std::atomic<int> unloadKey{0x23};  // END
     std::atomic<bool> requireHiddenCursor{true};
+
+    // [Menu] (the appearance keys of [Menu] and [Theme] are parsed by gui::theme)
+    std::atomic<int> menuKey{0x2D};  // INSERT
 
     // [Chat]
     std::atomic<bool> chatCommands{true};
@@ -52,7 +64,7 @@ struct Config {
     std::atomic<bool> textHotkeyEnabled{true};
     std::atomic<int> textHotkeyToggleKey{0};
     std::atomic<float> textHotkeyCooldown{1.0f};
-    std::vector<TextHotkeyEntry> textHotkeys;  // worker thread only
+    std::vector<TextHotkeyEntry> textHotkeys;  // worker thread only (the menu reads gui::Snapshot)
 
     // [Signatures] - empty means "use the built-in ones". Read once at startup.
     std::string sigGetFov;
@@ -77,6 +89,12 @@ bool Set(const std::string& section, const std::string& key, const std::string& 
 
 // Removes one key from config.ini and reloads.
 bool Remove(const std::string& section, const std::string& key);
+
+// Applies several changes, then reloads once.
+bool Apply(const std::vector<ConfigEntry>& entries);
+
+// All "key=value" lines of a section (comments skipped, values trimmed, inline comments removed).
+std::vector<std::pair<std::string, std::string>> ReadSection(const std::string& section);
 
 // Raw value from config.ini ("" if missing).
 std::string Get(const std::string& section, const std::string& key);

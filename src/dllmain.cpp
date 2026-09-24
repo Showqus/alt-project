@@ -12,7 +12,10 @@
 #include "features/autosprint.h"
 #include "features/zoom.h"
 #include "game.h"
+#include "gui/overlay.h"
+#include "gui/state.h"
 #include "hooks.h"
+#include "keys.h"
 #include "log.h"
 #include "notify.h"
 #include "text.h"
@@ -44,10 +47,10 @@ void LogGameVersion() {
 
 std::wstring ControlPath(const wchar_t* name) { return config::Directory() + L"\\control\\" + name; }
 
-// Tells the launcher which build is loaded into which process.
-void WriteStatus() {
+// Tells the launcher which build is loaded into which process (and whether the menu works).
+void WriteStatus(const std::string& menu) {
     if (FILE* f = _wfopen(ControlPath(L"status.txt").c_str(), L"wb")) {
-        fprintf(f, "version=%s\npid=%lu\n", BEDROCKQOL_VERSION, GetCurrentProcessId());
+        fprintf(f, "version=%s\npid=%lu\nmenu=%s\n", BEDROCKQOL_VERSION, GetCurrentProcessId(), menu.c_str());
         fclose(f);
     }
 }
@@ -99,12 +102,16 @@ void WorkerLoop(HANDLE unloadEvent) {
     unsigned lastHookEvents = hooks::KeyboardEventCount();
     unsigned transitionsWithoutHook = 0;
     ULONGLONG lastControlCheck = 0;
+    std::string menuStatus = "unavailable";
 
     while (WaitForSingleObject(unloadEvent, 10) == WAIT_TIMEOUT) {
         events::Event event;
         while (events::Pop(event)) {
             if (event.type == events::Type::Command) {
                 commands::Execute(event.text);
+            } else if (event.type == events::Type::ConfigWrite) {
+                gui::SetAppliedWrite(event.writeId);  // reported by the snapshot published after the reload
+                config::Apply(event.entries);
             } else {
                 commands::OnKeyPress(event.vk);
             }
@@ -119,6 +126,11 @@ void WorkerLoop(HANDLE unloadEvent) {
         if (now - lastControlCheck >= 250) {
             lastControlCheck = now;
             RunControlCommands();
+            const std::string menu = gui::overlay::Ready() ? gui::overlay::Status() : "unavailable";
+            if (menu != menuStatus) {
+                menuStatus = menu;
+                WriteStatus(menuStatus);
+            }
         }
 
         const bool focused = game::HasFocus();
@@ -148,7 +160,10 @@ void WorkerLoop(HANDLE unloadEvent) {
         // Polling fallback: no chat commands (Enter cannot be intercepted), everything else works.
         for (int vk = 1; vk < 256; ++vk) poller.Update(vk);
         const bool inWorld = focused && game::InWorld();
-        if (focused && poller.Pressed(cfg.unloadKey)) {
+        if (focused && poller.Pressed(cfg.menuKey) && cfg.menuKey > 0) {
+            gui::SetMenuOpen(!gui::MenuOpen() && gui::overlay::Ready());
+        }
+        if (focused && !gui::MenuOpen() && poller.Pressed(cfg.unloadKey)) {
             SetEvent(unloadEvent);
             break;
         }
@@ -178,13 +193,14 @@ DWORD WINAPI MainThread(LPVOID param) {
                    hooks::HasFovHook() ? "OK" : "unavailable", hooks::HasGammaHook() ? "OK" : "unavailable",
                    hooks::HasMouseHook() ? "OK" : "unavailable",
                    hooks::HasKeyboardHook() ? "hook" : "polling fallback");
-        WriteStatus();
-        notify::Send(std::string("BedrockQoL ") + BEDROCKQOL_VERSION + " загружен. Команды: " + config::Prefix() +
-                     "help");
+        WriteStatus("unavailable");
+        notify::Send(std::string("BedrockQoL ") + BEDROCKQOL_VERSION + " загружен. Меню: " +
+                     keys::Name(g_config.menuKey) + ", команды: " + config::Prefix() + "help");
         WorkerLoop(hooks::UnloadEvent());
     }
 
     logx::Info("Unloading...");
+    gui::overlay::Shutdown();
     autosprint::ReleaseFallback();
     zoom::Reset();
     hooks::Uninstall();

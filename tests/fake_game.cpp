@@ -1,21 +1,30 @@
 // Smoke test for BedrockQoL.dll (run under Windows or Wine; under Wine use an X display, e.g.
-// xvfb-run, so keyboard layout functions work).
+// xvfb-run, so keyboard layout functions and Direct3D work).
 //
 // This executable plays the role of Minecraft.Windows.exe: its .text section contains functions
 // whose machine code matches the 1.21.5x signatures the DLL scans for (LevelRendererPlayer::getFov,
-// Keyboard::feed, the MouseDevice::feed call site, Options::getGamma). It loads the DLL, drives
-// those functions like the game would and checks the results.
+// Keyboard::feed, the MouseDevice::feed call site, Options::getGamma), and a render thread presents
+// frames through a Direct3D 11 (or 12) swap chain like the game does, so the in-game menu is drawn
+// into them. It loads the DLL, drives those functions like the game would and checks the results,
+// including the pixels of the presented frames.
 //
-//   fake_game.exe BedrockQoL.dll     run the tests
-//   fake_game.exe --host <seconds>   just stay alive (target process for the launcher test)
+//   fake_game.exe BedrockQoL.dll            run the tests (Direct3D 11)
+//   fake_game.exe BedrockQoL.dll --d3d12    run the tests with a Direct3D 12 swap chain
+//   fake_game.exe --host <seconds>          just stay alive (target process for the launcher test)
 
 #include <windows.h>
+#include <d3d11.h>
+#include <d3d12.h>
+#include <dxgi1_4.h>
 
+#include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 extern "C" {
 float g_fakeFov = 90.0f;
@@ -141,6 +150,381 @@ fake_mouseCaller:
 namespace {
 
 int g_failures = 0;
+
+// --- Render thread ---------------------------------------------------------------------------
+// Like the game's render thread: clears the back buffer and presents about 100 times per second, so
+// the DLL's IDXGISwapChain::Present hook draws the menu into the frame. Capture() reads back the last
+// presented frame (both swap chains keep their contents after Present).
+
+constexpr UINT kWidth = 800;
+constexpr UINT kHeight = 600;
+const float kClear[4] = {0.10f, 0.20f, 0.30f, 1.0f};  // RGB 26, 51, 77
+
+bool g_useD3D12 = false;
+std::atomic<bool> g_renderStop{false};
+std::atomic<bool> g_renderPause{false};  // see main()
+std::atomic<uint32_t> g_resizeTo{0};       // (width << 16) | height: ResizeBuffers on the render thread
+std::atomic<long> g_resizeResult{0};
+std::atomic<bool> g_renderPaused{false};
+std::atomic<int> g_rendererState{0};  // 0 = starting, 1 = presenting, -1 = failed
+std::atomic<unsigned> g_frames{0};
+std::atomic<bool> g_captureWanted{false};
+HANDLE g_captureDone = nullptr;
+std::vector<uint32_t> g_captured;  // RGBA8, kWidth x kHeight
+void* g_presentFn = nullptr;       // IDXGISwapChain::Present used by the "game"
+HANDLE g_renderThread = nullptr;
+
+void PumpMessages() {
+    MSG msg;
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
+void StoreCapture(const uint8_t* data, UINT rowPitch) {
+    g_captured.resize(static_cast<size_t>(kWidth) * kHeight);
+    for (UINT y = 0; y < kHeight; ++y) std::memcpy(&g_captured[y * kWidth], data + y * rowPitch, kWidth * 4);
+}
+
+void RunD3D11(HWND hwnd) {
+    DXGI_SWAP_CHAIN_DESC sd{};
+    sd.BufferCount = 1;
+    sd.BufferDesc.Width = kWidth;
+    sd.BufferDesc.Height = kHeight;
+    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.OutputWindow = hwnd;
+    sd.SampleDesc.Count = 1;
+    sd.Windowed = TRUE;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_SEQUENTIAL;  // the back buffer keeps the presented frame
+    IDXGISwapChain* chain = nullptr;
+    ID3D11Device* device = nullptr;
+    ID3D11DeviceContext* context = nullptr;
+    if (FAILED(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+                                             D3D11_SDK_VERSION, &sd, &chain, &device, nullptr, &context))) {
+        g_rendererState = -1;
+        return;
+    }
+    g_presentFn = (*reinterpret_cast<void***>(chain))[8];
+    ID3D11Texture2D* buffer = nullptr;
+    chain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&buffer));
+    ID3D11RenderTargetView* view = nullptr;
+    device->CreateRenderTargetView(buffer, nullptr, &view);
+    D3D11_TEXTURE2D_DESC td{};
+    buffer->GetDesc(&td);
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    td.MiscFlags = 0;
+    ID3D11Texture2D* staging = nullptr;
+    device->CreateTexture2D(&td, nullptr, &staging);
+
+    g_rendererState = 1;
+    while (!g_renderStop) {
+        PumpMessages();
+        g_renderPaused = g_renderPause.load();
+        if (g_renderPaused) {
+            Sleep(5);
+            continue;
+        }
+        if (const uint32_t size = g_resizeTo.exchange(0)) {
+            // Like the game when its window changes size: drop the views, resize, recreate.
+            view->Release();
+            buffer->Release();
+            const HRESULT hr = chain->ResizeBuffers(0, size >> 16, size & 0xFFFF, DXGI_FORMAT_UNKNOWN, 0);
+            chain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&buffer));
+            device->CreateRenderTargetView(buffer, nullptr, &view);
+            g_resizeResult = hr;
+        }
+        context->ClearRenderTargetView(view, kClear);
+        chain->Present(0, 0);
+        ++g_frames;
+        D3D11_TEXTURE2D_DESC current{};
+        buffer->GetDesc(&current);
+        if (g_captureWanted && current.Width == kWidth && current.Height == kHeight) {
+            context->CopyResource(staging, buffer);
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            if (SUCCEEDED(context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped))) {
+                StoreCapture(static_cast<const uint8_t*>(mapped.pData), mapped.RowPitch);
+                context->Unmap(staging, 0);
+            }
+            g_captureWanted = false;
+            SetEvent(g_captureDone);
+        }
+        Sleep(8);
+    }
+    staging->Release();
+    view->Release();
+    buffer->Release();
+    context->Release();
+    chain->Release();
+    device->Release();
+}
+
+void Transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12_RESOURCE_STATES from,
+                D3D12_RESOURCE_STATES to) {
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = resource;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = from;
+    b.Transition.StateAfter = to;
+    list->ResourceBarrier(1, &b);
+}
+
+void RunD3D12(HWND hwnd) {
+    ID3D12Device* device = nullptr;
+    ID3D12CommandQueue* queue = nullptr;
+    IDXGIFactory4* factory = nullptr;
+    IDXGISwapChain1* chain1 = nullptr;
+    IDXGISwapChain3* chain = nullptr;
+    D3D12_COMMAND_QUEUE_DESC qd{};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    DXGI_SWAP_CHAIN_DESC1 sd{};
+    sd.Width = kWidth;
+    sd.Height = kHeight;
+    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.SampleDesc.Count = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount = 2;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
+                                 reinterpret_cast<void**>(&device))) ||
+        FAILED(device->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&queue))) ||
+        FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory))) ||
+        FAILED(factory->CreateSwapChainForHwnd(queue, hwnd, &sd, nullptr, nullptr, &chain1)) ||
+        FAILED(chain1->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void**>(&chain)))) {
+        g_rendererState = -1;
+        return;
+    }
+    g_presentFn = (*reinterpret_cast<void***>(chain))[8];
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    hd.NumDescriptors = 2;
+    ID3D12DescriptorHeap* heap = nullptr;
+    device->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap), reinterpret_cast<void**>(&heap));
+    const UINT rtvSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    ID3D12Resource* buffers[2] = {};
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv[2];
+    for (UINT i = 0; i < 2; ++i) {
+        chain->GetBuffer(i, __uuidof(ID3D12Resource), reinterpret_cast<void**>(&buffers[i]));
+        rtv[i] = heap->GetCPUDescriptorHandleForHeapStart();
+        rtv[i].ptr += i * rtvSize;
+        device->CreateRenderTargetView(buffers[i], nullptr, rtv[i]);
+    }
+    ID3D12CommandAllocator* allocator = nullptr;
+    device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator),
+                                   reinterpret_cast<void**>(&allocator));
+    ID3D12GraphicsCommandList* list = nullptr;
+    device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr, __uuidof(ID3D12GraphicsCommandList),
+                              reinterpret_cast<void**>(&list));
+    list->Close();
+    ID3D12Fence* fence = nullptr;
+    device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&fence));
+    HANDLE fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    UINT64 fenceValue = 0;
+    auto waitGpu = [&] {
+        queue->Signal(fence, ++fenceValue);
+        if (fence->GetCompletedValue() < fenceValue) {
+            fence->SetEventOnCompletion(fenceValue, fenceEvent);
+            WaitForSingleObject(fenceEvent, 5000);
+        }
+    };
+
+    // Read-back buffer for Capture().
+    const D3D12_RESOURCE_DESC bufferDesc = buffers[0]->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT64 total = 0;
+    device->GetCopyableFootprints(&bufferDesc, 0, 1, 0, &footprint, nullptr, nullptr, &total);
+    D3D12_HEAP_PROPERTIES heapProps{};
+    heapProps.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = total;
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* readback = nullptr;
+    device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                    __uuidof(ID3D12Resource), reinterpret_cast<void**>(&readback));
+
+    g_rendererState = 1;
+    while (!g_renderStop) {
+        g_renderPaused = g_renderPause.load();
+        if (g_renderPaused) {
+            Sleep(5);
+            continue;
+        }
+        PumpMessages();
+        if (const uint32_t size = g_resizeTo.exchange(0)) {
+            waitGpu();
+            for (ID3D12Resource*& b : buffers) {
+                b->Release();
+                b = nullptr;
+            }
+            const HRESULT hr = chain->ResizeBuffers(2, size >> 16, size & 0xFFFF, DXGI_FORMAT_UNKNOWN, 0);
+            for (UINT i = 0; i < 2; ++i) {
+                chain->GetBuffer(i, __uuidof(ID3D12Resource), reinterpret_cast<void**>(&buffers[i]));
+                device->CreateRenderTargetView(buffers[i], nullptr, rtv[i]);
+            }
+            g_resizeResult = hr;
+        }
+        const UINT index = chain->GetCurrentBackBufferIndex();
+        allocator->Reset();
+        list->Reset(allocator, nullptr);
+        Transition(list, buffers[index], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        list->ClearRenderTargetView(rtv[index], kClear, 0, nullptr);
+        Transition(list, buffers[index], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+        list->Close();
+        ID3D12CommandList* lists[] = {list};
+        queue->ExecuteCommandLists(1, lists);
+        chain->Present(0, 0);
+        waitGpu();
+        ++g_frames;
+        if (g_captureWanted && buffers[index]->GetDesc().Width == kWidth && buffers[index]->GetDesc().Height == kHeight) {
+            allocator->Reset();
+            list->Reset(allocator, nullptr);
+            Transition(list, buffers[index], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION dst{};
+            dst.pResource = readback;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint = footprint;
+            D3D12_TEXTURE_COPY_LOCATION src{};
+            src.pResource = buffers[index];
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.SubresourceIndex = 0;
+            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            Transition(list, buffers[index], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+            list->Close();
+            queue->ExecuteCommandLists(1, lists);
+            waitGpu();
+            void* data = nullptr;
+            D3D12_RANGE range{0, static_cast<SIZE_T>(total)};
+            if (SUCCEEDED(readback->Map(0, &range, &data))) {
+                StoreCapture(static_cast<const uint8_t*>(data), footprint.Footprint.RowPitch);
+                D3D12_RANGE none{0, 0};
+                readback->Unmap(0, &none);
+            }
+            g_captureWanted = false;
+            SetEvent(g_captureDone);
+        }
+        Sleep(8);
+    }
+    waitGpu();
+    CloseHandle(fenceEvent);
+    readback->Release();
+    fence->Release();
+    list->Release();
+    allocator->Release();
+    for (ID3D12Resource* b : buffers) b->Release();
+    heap->Release();
+    chain->Release();
+    chain1->Release();
+    factory->Release();
+    queue->Release();
+    device->Release();
+}
+
+DWORD WINAPI RenderThread(LPVOID) {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"FakeMinecraft";
+    RegisterClassW(&wc);
+    RECT r{0, 0, static_cast<LONG>(kWidth), static_cast<LONG>(kHeight)};
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    HWND hwnd = CreateWindowW(L"FakeMinecraft", L"Fake Minecraft", WS_OVERLAPPEDWINDOW, 0, 0, r.right - r.left,
+                              r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!hwnd) {
+        g_rendererState = -1;
+        return 0;
+    }
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    if (g_useD3D12) {
+        RunD3D12(hwnd);
+    } else {
+        RunD3D11(hwnd);
+    }
+    DestroyWindow(hwnd);
+    return 0;
+}
+
+bool StartRenderer() {
+    g_captureDone = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_renderThread = CreateThread(nullptr, 0, RenderThread, nullptr, 0, nullptr);
+    const ULONGLONG end = GetTickCount64() + 20000;
+    while (g_rendererState == 0 && GetTickCount64() < end) Sleep(10);
+    return g_rendererState == 1;
+}
+
+void StopRenderer() {
+    g_renderStop = true;
+    if (g_renderThread) {
+        WaitForSingleObject(g_renderThread, 5000);
+        CloseHandle(g_renderThread);
+        g_renderThread = nullptr;
+    }
+}
+
+// Resizes the swap chain buffers on the render thread; returns the HRESULT of ResizeBuffers.
+long Resize(UINT width, UINT height) {
+    g_resizeResult = 1;
+    g_resizeTo = (width << 16) | height;
+    const ULONGLONG end = GetTickCount64() + 5000;
+    while (g_resizeResult == 1 && GetTickCount64() < end) Sleep(5);
+    return g_resizeResult;
+}
+
+// The last presented frame.
+std::vector<uint32_t> Capture() {
+    if (g_rendererState != 1) return {};
+    ResetEvent(g_captureDone);
+    g_captureWanted = true;
+    if (WaitForSingleObject(g_captureDone, 5000) != WAIT_OBJECT_0) return {};
+    return g_captured;
+}
+
+bool PixelNear(const std::vector<uint32_t>& frame, int x, int y, int r, int g, int b, int tolerance = 6) {
+    if (frame.empty()) return false;
+    const uint32_t p = frame[static_cast<size_t>(y) * kWidth + x];
+    const int pr = p & 0xFF, pg = (p >> 8) & 0xFF, pb = (p >> 16) & 0xFF;
+    return std::abs(pr - r) <= tolerance && std::abs(pg - g) <= tolerance && std::abs(pb - b) <= tolerance;
+}
+
+// FAKE_GAME_SCREENSHOTS=<folder>: saves the presented frame as <folder>\<name>.bmp (for looking at the menu).
+void Screenshot(const char* name) {
+    const char* folder = std::getenv("FAKE_GAME_SCREENSHOTS");
+    if (!folder) return;
+    Sleep(250);  // let fades and layout settle
+    const std::vector<uint32_t> frame = Capture();
+    if (frame.empty()) return;
+    const std::string path = std::string(folder) + "\\" + name + ".bmp";
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return;
+    unsigned char header[54] = {'B', 'M'};
+    auto put32 = [&](int offset, uint32_t v) { std::memcpy(header + offset, &v, 4); };
+    put32(2, 54 + kWidth * kHeight * 4);
+    put32(10, 54);
+    put32(14, 40);
+    put32(18, kWidth);
+    put32(22, static_cast<uint32_t>(-static_cast<int32_t>(kHeight)));  // top-down
+    header[26] = 1;
+    header[28] = 32;
+    std::fwrite(header, 1, sizeof(header), f);
+    for (uint32_t p : frame) {
+        const unsigned char bgra[4] = {static_cast<unsigned char>(p >> 16), static_cast<unsigned char>(p >> 8),
+                                       static_cast<unsigned char>(p), 255};
+        std::fwrite(bgra, 1, 4, f);
+    }
+    std::fclose(f);
+}
+
+// The game's own clear color (nothing drawn over it).
+bool IsClear(const std::vector<uint32_t>& frame, int x, int y) { return PixelNear(frame, x, y, 26, 51, 77, 3); }
 
 // Options object for fake_getGamma: first qword points to a "vtable" with a readable +0x60 slot,
 // byte +0x1820 is non-zero.
@@ -287,6 +671,238 @@ int RunHost(int seconds) {
     return 0;
 }
 
+
+// --- In-game menu ------------------------------------------------------------------------------
+
+using FindItemFn = int (*)(const char* label, float* rect);
+FindItemFn g_findItem = nullptr;
+
+bool FindItem(const char* label, float* rect = nullptr) {
+    float r[4];
+    return g_findItem && g_findItem(label, rect ? rect : r) != 0;
+}
+
+void MouseMove(int x, int y) { fake_mouseFeed(nullptr, 0, 0, static_cast<short>(x), static_cast<short>(y), 0, 0, 0); }
+
+void Click(int x, int y) {
+    MouseMove(x, y);
+    Sleep(40);
+    fake_mouseFeed(nullptr, 1, 1, static_cast<short>(x), static_cast<short>(y), 0, 0, 0);
+    Sleep(60);
+    fake_mouseFeed(nullptr, 1, 0, static_cast<short>(x), static_cast<short>(y), 0, 0, 0);
+}
+
+// Clicks the middle of a widget of the menu (found by its ImGui label / "##id"), once its position
+// is stable (a window that just appeared or changed page settles within a few frames).
+bool ClickItem(const char* label) {
+    float r[4] = {};
+    float previous[4] = {-1, -1, -1, -1};
+    const bool found = WaitFor([&] {
+        if (!FindItem(label, r) || r[2] <= 0 || r[3] <= 0) return false;
+        const bool stable = std::memcmp(r, previous, sizeof(r)) == 0;
+        std::memcpy(previous, r, sizeof(r));
+        if (!stable) Sleep(60);
+        return stable;
+    }, 3000);
+    if (!found) return false;
+    if (std::getenv("FAKE_GAME_VERBOSE")) std::printf("  click %s at %.0f,%.0f %.0fx%.0f\n", label, r[0], r[1], r[2], r[3]);
+    Click(static_cast<int>(r[0] + r[2] * 0.5f), static_cast<int>(r[1] + r[3] * 0.5f));
+    Sleep(80);
+    return true;
+}
+
+// Runs control commands (like BedrockQoLLauncher.exe --cmd) and waits until the DLL took the file.
+void Commands(const char* lines) {
+    const std::wstring path = DataDir() + L"\\control\\commands.txt";
+    WaitFor([&] { return GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES; }, 2000);
+    WriteFile(path, lines);
+    WaitFor([&] { return GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES; }, 2000);
+    Sleep(100);
+}
+
+std::wstring IniGetFileW(const std::wstring& file, const wchar_t* section, const wchar_t* key) {
+    wchar_t buffer[512] = {};
+    GetPrivateProfileStringW(section, key, L"", buffer, 512, file.c_str());
+    return buffer;
+}
+
+// 4x4 24-bit BMP of one color.
+void WriteBmp(const std::wstring& path, unsigned char r, unsigned char g, unsigned char b) {
+    unsigned char file[54 + 48] = {'B', 'M'};
+    auto put32 = [&](int offset, uint32_t v) { std::memcpy(file + offset, &v, 4); };
+    put32(2, sizeof(file));
+    put32(10, 54);
+    put32(14, 40);
+    put32(18, 4);
+    put32(22, 4);
+    file[26] = 1;
+    file[28] = 24;
+    for (int i = 0; i < 16; ++i) {
+        file[54 + i * 3] = b;
+        file[54 + i * 3 + 1] = g;
+        file[54 + i * 3 + 2] = r;
+    }
+    FILE* f = _wfopen(path.c_str(), L"wb");
+    fwrite(file, 1, sizeof(file), f);
+    fclose(f);
+}
+
+std::wstring ExeDir() {
+    wchar_t path[MAX_PATH];
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    std::wstring dir = path;
+    return dir.substr(0, dir.find_last_of(L"\\/"));
+}
+
+void MenuTests(HMODULE module) {
+    const std::wstring status = DataDir() + L"\\control\\status.txt";
+    const std::wstring log = DataDir() + L"\\BedrockQoL.log";
+    const char* api = g_useD3D12 ? "menu=Direct3D 12" : "menu=Direct3D 11";
+
+    g_findItem = reinterpret_cast<FindItemFn>(reinterpret_cast<void*>(GetProcAddress(module, "BedrockQoL_FindItem")));
+    Check(g_findItem != nullptr, "DLL exports BedrockQoL_FindItem (widget lookup for tests)");
+    Check(IsHooked(g_presentFn), "IDXGISwapChain::Present of the game's swap chain is hooked");
+    Check(WaitFor([&] { return FileContains(status, api); }, 5000),
+          g_useD3D12 ? "menu renderer ready (status.txt: menu=Direct3D 12)" : "menu renderer ready (status.txt: menu=Direct3D 11)");
+    if (std::getenv("FAKE_GAME_SCREENSHOTS")) Commands("set Menu.Notifications 0\n");  // clean pictures
+    Check(IsClear(Capture(), 400, 300), "menu closed: the game's frame is untouched");
+
+    // Opening: the key is swallowed, keys held in the game are released.
+    Key('W', true);
+    const unsigned insertDowns = g_keyDowns[VK_INSERT];
+    Tap(VK_INSERT);
+    Check(g_keyDowns[VK_INSERT] == insertDowns, "INSERT opens the menu and does not reach the game");
+    Check(WaitFor([] { return FindItem("BedrockQoL"); }, 3000), "menu window is drawn");
+    Check(g_keyStates['W'] == 0, "keys held when the menu opens are released in the game");
+    Key('W', false);
+    Check(WaitFor([] { return !IsClear(Capture(), 400, 300); }, 2000), "menu is visible in the presented frame");
+    Screenshot("1-modules");
+
+    // Input belongs to the menu while it is open.
+    const unsigned wDowns = g_keyDowns['W'];
+    Tap('W');
+    Check(g_keyDowns['W'] == wDowns, "keys pressed while the menu is open do not reach the game");
+    g_lastMouseButton = -1;
+    fake_mouseFeed(nullptr, 4, static_cast<char>(0x88), 400, 300, 0, 0, 0);
+    MouseMove(400, 300);
+    Check(g_lastMouseButton == -1, "mouse input does not reach the game while the menu is open");
+
+    // Modules page: switches, key binds, settings.
+    Check(ClickItem("##toggle.fullbright") && WaitIni("Fullbright", "Enabled", "1"),
+          "clicking the Fullbright switch enables it (saved to config.ini)");
+    Check(WaitFor([] { return Near(Gamma(), 25.0f); }, 2000), "Fullbright is really on (gamma 25)");
+    Check(ClickItem("##toggle.fullbright") && WaitIni("Fullbright", "Enabled", "0"), "clicking it again disables it");
+    Check(ClickItem("##bind.Zoom.Key") &&
+              WaitFor([] { return FindItem("\xD0\x9D\xD0\xB0\xD0\xB6\xD0\xBC\xD0\xB8\xD1\x82\xD0\xB5 "
+                                           "\xD0\xBA\xD0\xBB\xD0\xB0\xD0\xB2\xD0\xB8\xD1\x88\xD1\x83...##bind.Zoom.Key"); },
+                      2000),
+          "zoom key button waits for a key");
+    Tap('V');
+    Check(WaitIni("Zoom", "Key", "V"), "pressing V binds zoom to V (saved to config.ini)");
+    Check(WaitFor([] { return FindItem("V##bind.Zoom.Key"); }, 2000), "the button shows the new key");
+    Check(ClickItem("##settings.fullbright") && WaitFor([] { return FindItem("##fullbright.gamma"); }, 2000),
+          "module settings open inside the card");
+    Screenshot("2-module-settings");
+
+    // Other pages.
+    Check(ClickItem("##nav.binds") && WaitFor([] { return FindItem("##bind.Menu.Key"); }, 2000),
+          "Binds page lists every key, including the menu key");
+    Screenshot("3-binds");
+    Check(ClickItem("##nav.appearance") && WaitFor([] { return FindItem("##tab.colors"); }, 2000),
+          "Appearance page opens");
+    Screenshot("4-appearance-colors");
+    Check(ClickItem("##preset.6") && WaitIni("Theme", "WindowRounding", "0") && IniGet("Theme", "Accent") == "#5BA02EFF",
+          "clicking the Minecraft preset writes its colors and sizes to config.ini [Theme]");
+    Screenshot("5-minecraft-preset");
+    Check(ClickItem("##tab.sizes") && WaitFor([] { return FindItem("##size.WindowRounding"); }, 2000),
+          "Sizes tab lists the style sizes");
+    Screenshot("6-sizes");
+    Check(ClickItem("##nav.configs") && WaitFor([] { return FindItem("##cfgsave"); }, 2000), "Configs page opens");
+    Screenshot("7-configs");
+
+    // Colors from config.ini are what the menu draws.
+    float window[4] = {};
+    FindItem("BedrockQoL", window);
+    const int sideX = static_cast<int>(window[0] + 30);
+    const int sideY = static_cast<int>(window[1] + window[3] * 0.8f);
+    Commands("set Theme.SidebarBg #FF0000FF\n");
+    Check(WaitFor([&] { return PixelNear(Capture(), sideX, sideY, 255, 0, 0); }, 3000),
+          "[Theme] SidebarBg=#FF0000FF paints the sidebar red");
+    Commands("set Theme.SidebarBg #00000000\nset Theme.WindowBg #00FF00FF\n");
+    Check(WaitFor([&] { return PixelNear(Capture(), sideX, sideY, 0, 255, 0); }, 3000),
+          "[Theme] WindowBg=#00FF00FF paints the window green");
+
+    // Background picture behind the menu.
+    CreateDirectoryW((DataDir() + L"\\images").c_str(), nullptr);
+    WriteBmp(DataDir() + L"\\images\\bg.bmp", 0, 0, 255);
+    Check(PixelNear(Capture(), 3, 3, 16, 31, 46, 4), "the game is dimmed behind the menu (ScreenDim)");
+    Commands("set Menu.DimScreen 0\nset Menu.BackgroundTarget screen\nset Menu.BackgroundOpacity 1\n"
+             "set Menu.Background bg.bmp\n");
+    Check(WaitFor([] { return PixelNear(Capture(), 3, 3, 0, 0, 255); }, 3000),
+          "background picture from BedrockQoL\\images is drawn over the whole screen");
+    Commands("set Menu.Background missing.png\n");
+    Check(WaitFor([&] { return FileContains(log, "background 'missing.png' not found"); }, 3000) &&
+              WaitFor([] { return IsClear(Capture(), 3, 3); }, 3000),
+          "a missing picture is reported and not drawn");
+
+    // Fonts: BedrockQoL\fonts, errors fall back to the built-in font.
+    CreateDirectoryW((DataDir() + L"\\fonts").c_str(), nullptr);
+    Check(CopyFileW((ExeDir() + L"\\test-font.ttf").c_str(), (DataDir() + L"\\fonts\\test.ttf").c_str(), FALSE) != 0,
+          "test font copied to BedrockQoL\\fonts");
+    Commands("set Menu.Font test.ttf\nset Menu.FontSize 20\n");
+    Check(WaitFor([&] { return FileContains(log, "fonts\\test.ttf loaded"); }, 3000), "font from BedrockQoL\\fonts loaded");
+    Commands("set Menu.Font nope.ttf\n");
+    Check(WaitFor([&] { return FileContains(log, "font 'nope.ttf' not found"); }, 3000) &&
+              WaitFor([&] { return PixelNear(Capture(), sideX, sideY, 0, 255, 0); }, 3000),
+          "a missing font is reported and the menu keeps working");
+
+    // Appearance is part of every config profile.
+    Commands("config save gui1\n");
+    Check(WaitFor([] { return IniGetFileW(DataDir() + L"\\configs\\gui1.ini", L"Theme", L"WindowBg") == L"#00FF00FF"; }, 2000),
+          "config profile contains the menu theme");
+    Commands("set Theme.WindowBg #0000FFFF\n");
+    Check(WaitFor([&] { return PixelNear(Capture(), sideX, sideY, 0, 0, 255); }, 3000), "theme changed (blue window)");
+    Commands("config load gui1\n");
+    Check(WaitFor([&] { return PixelNear(Capture(), sideX, sideY, 0, 255, 0); }, 3000) &&
+              IniGet("Theme", "WindowBg") == "#00FF00FF",
+          "loading the profile restores its theme");
+
+    // JSON themes.
+    Commands("theme save t1\n");
+    Check(WaitFor([] { return FileContains(DataDir() + L"\\themes\\t1.json", "\"WindowBg\": \"#00FF00FF\""); }, 2000) &&
+              FileContains(DataDir() + L"\\themes\\t1.json", "\"file\": \"nope.ttf\""),
+          "theme saved as JSON (themes\\t1.json with colors and font)");
+    Commands("theme reset\n");
+    Check(WaitFor([] { return IniGet("Theme", "WindowBg").empty() && IniGet("Menu", "Font").empty(); }, 2000),
+          "theme reset clears [Theme] and the font");
+    Commands("theme load t1\n");
+    Check(WaitIni("Theme", "WindowBg", "#00FF00FF") && IniGet("Menu", "Font") == "nope.ttf" &&
+              IniGet("Theme", "WindowRounding") == "0",
+          "theme loaded back from JSON");
+
+    // The game resizes its buffers (window resized) while the menu is drawn.
+    Check(Resize(1024, 640) == S_OK, "ResizeBuffers succeeds while the menu is open (no buffer kept by the menu)");
+    Check(WaitFor([&] { return FileContains(status, "1024x640"); }, 3000), "menu follows the new size (1024x640)");
+    Check(Resize(kWidth, kHeight) == S_OK, "resizing back succeeds");
+    Check(WaitFor([&] { return PixelNear(Capture(), sideX, sideY, 0, 255, 0); }, 3000),
+          "menu is drawn again after the resize");
+
+    // Closing.
+    const unsigned escDowns = g_keyDowns[VK_ESCAPE];
+    Tap(VK_ESCAPE);
+    Check(g_keyDowns[VK_ESCAPE] == escDowns, "Esc closes the menu and does not reach the game");
+    Check(WaitFor([] { return IsClear(Capture(), 400, 300); }, 2000), "menu closed: nothing drawn over the game");
+    Key('W', true);
+    Check(g_keyStates['W'] == 1, "keys reach the game again after closing");
+    Key('W', false);
+
+    Commands("menu\n");
+    Check(WaitFor([] { return !IsClear(Capture(), 400, 300); }, 2000), "the menu command opens the menu");
+    Tap(VK_INSERT);
+    Check(WaitFor([] { return IsClear(Capture(), 400, 300); }, 2000), "INSERT closes it again");
+    Commands("set Menu.Notifications 0\n");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -296,16 +912,43 @@ int main(int argc, char** argv) {
 
     if (argc > 2 && std::strcmp(argv[1], "--host") == 0) return RunHost(std::atoi(argv[2]));
 
-    const char* dll = argc > 1 ? argv[1] : "BedrockQoL.dll";
+    const char* dll = "BedrockQoL.dll";
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--d3d12") == 0) {
+            g_useD3D12 = true;
+        } else {
+            dll = argv[i];
+        }
+    }
+    const ULONGLONG renderStart = GetTickCount64();
+    const bool rendering = StartRenderer();
+    std::printf("Renderer: %s (%s after %llu ms)\n", g_useD3D12 ? "Direct3D 12" : "Direct3D 11",
+                rendering ? "presenting" : g_rendererState == 0 ? "still starting" : "failed",
+                GetTickCount64() - renderStart);
+    Check(rendering, "fake game renders frames (swap chain created)");
     WriteTestConfig();
     DeleteFileW((DataDir() + L"\\control\\commands.txt").c_str());
 
     Check(Near(Fov(90.0f), 90.0f), "getFov works before injection");
     Check(Near(Gamma(), 1.0f), "getGamma works before injection");
 
+    // Under Wine, creating a DXGI factory (which the DLL does to find IDXGISwapChain::Present) can
+    // deadlock inside Mesa's GLX while another thread presents a Vulkan-backed Direct3D 12 swap chain.
+    // Windows does not have this problem, and the Direct3D 11 run keeps presenting during injection,
+    // so the Direct3D 12 run pauses its render loop until the DLL has set up its hooks.
+    DeleteFileW((DataDir() + L"\\BedrockQoL.log").c_str());  // "Ready." below must come from this run
+    if (g_useD3D12 && rendering) {
+        g_renderPause = true;
+        WaitFor([] { return g_renderPaused.load(); }, 2000);
+        Sleep(300);  // let the swap chain's own present thread finish the queued frames
+    }
     HMODULE module = LoadLibraryA(dll);
     Check(module != nullptr, "DLL loads");
     if (!module) return 1;
+    if (g_useD3D12) {
+        WaitFor([] { return FileContains(DataDir() + L"\\BedrockQoL.log", "] Ready."); }, 20000);
+        g_renderPause = false;
+    }
 
     Check(WaitFor([] { return IsHooked((void*)fake_getFov) && IsHooked((void*)fake_keyboardFeed) &&
                               IsHooked((void*)fake_mouseFeed) && IsHooked((void*)fake_getGamma); },
@@ -455,13 +1098,28 @@ int main(int argc, char** argv) {
     Check(WaitFor([] { return IniGetW(L"TextHotkeys", L"3") == L"F9|\u043F\u0440\u0438\u0432\u0435\u0442 \U0001F600"; }, 2000),
           "Cyrillic/emoji TextHotkey text survives config.ini");
 
-    // --- Unload through a chat command ---
-    Check(!Chat(";unload"), ";unload not sent");
-    Check(WaitFor([] { return GetModuleHandleA("BedrockQoL.dll") == nullptr; }, 5000), ";unload unloads the DLL");
+    // --- In-game menu ---
+    if (rendering) MenuTests(module);
+
+    // --- Unload with the menu's button (or a chat command without a renderer) ---
+    if (rendering) {
+        Tap(VK_INSERT);
+        Check(ClickItem("##nav.general") && ClickItem("##general.unload"), "menu button 'Unload' clicked");
+    } else {
+        Check(!Chat(";unload"), ";unload not sent");
+    }
+    Check(WaitFor([] { return GetModuleHandleA("BedrockQoL.dll") == nullptr; }, 5000), "unload unloads the DLL");
     Check(!IsHooked((void*)fake_getFov) && !IsHooked((void*)fake_keyboardFeed) && !IsHooked((void*)fake_getGamma),
           "hooks removed after unload");
     Check(Near(Fov(90.0f), 90.0f) && Near(Gamma(), 1.0f), "game functions work after unload");
     Check(Chat(";toggle zoom"), "after unload chat goes to the game again");
+    if (rendering) {
+        Check(!IsHooked(g_presentFn), "Present unhooked after unload");
+        const unsigned frames = g_frames;
+        Check(WaitFor([&] { return g_frames > frames + 5; }, 2000) && IsClear(Capture(), 400, 300),
+              "the game keeps presenting clean frames after unload");
+    }
+    StopRenderer();
 
     std::printf("\n%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
